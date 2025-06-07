@@ -856,6 +856,7 @@ namespace Valuation.Api.Services
                             imageData: photoStreams.TryGetValue("ChassisImprint", out var t) ? t : null
                             );
 
+                            col.Item().PaddingBottom(10);
                             // 3) DISCLAIMER box (full width)
                             col.Item()
                             .Border(1)
@@ -897,15 +898,78 @@ namespace Valuation.Api.Services
                                 });
                             });
 
+
                             // 5) Footer line + contact info
                             col.Item().PaddingBottom(5).LineHorizontal(1).LineColor(Colors.Grey.Lighten2);
 
+                            col.Item()
+                               .Grid(grid =>
+                               {
+                                   grid.Columns(2);        // two per row
+                                   grid.Spacing(10);
+
+                                   foreach (var kvp in photoStreams)
+                                   {
+                                       var imageData = kvp.Value;
+                                       var dateText = doc.InspectionDetails.DateOfInspection
+                                                           ?.ToString("d MMM yyyy h:mm:ss tt", CultureInfo.InvariantCulture)
+                                                       ?? "";
+                                       var locText = doc.InspectionDetails.InspectionLocation ?? "";
+
+                                       grid.Item().Column(c =>
+                                       {
+                                           // fixed‐size box
+                                           c.Item()
+                                               .Width(320)     // fixed width 8x4
+                                               .Height(240)    // fixed height 8x3
+                                               .Border(1)
+                                               .BorderColor(Colors.Blue.Darken2)
+                                               .Stack(stack =>
+                                               {
+                                                   // 1) Photo at bottom layer
+                                                   stack.Item()
+                                                       .Image(imageData, ImageScaling.FitArea);
+
+                                                   // 2) Overlay date+location at top‐left
+                                                   stack.Item()
+                                                       .Padding(5)
+                                                       .Background(Colors.Black.WithAlpha(1))  // semi‐transparent bg
+                                                       .AlignTop()
+                                                       .AlignLeft()
+                                                       .Column(txt =>
+                                                       {
+                                                           txt.Item()
+                                                               .Text(dateText)
+                                                               .FontSize(8)
+                                                               .FontColor(Colors.White);
+
+                                                           txt.Item()
+                                                               .Text(locText)
+                                                               .FontSize(8)
+                                                               .FontColor(Colors.White);
+                                                       });
+                                               });
+
+                                           // caption below
+                                           c.Item()
+                                               .PaddingTop(5)
+                                               .AlignCenter()
+                                               .Text(kvp.Key)
+                                               .FontSize(9)
+                                               .SemiBold();
+                                       });
+                                   }
+                               });
+
+
                         });
 
-                        
+
                         // 3.8) Disclaimer + Icons Footer
                         main.Item().Column(col =>
                         {
+                            col.Item().PaddingTop(20);
+
                             // Disclaimer
                             col.Item()
                                .Text("THIS REPORT IS ISSUED WITHOUT PREJUDICE")
@@ -952,65 +1016,7 @@ namespace Valuation.Api.Services
                                                 .Text("📱 +91 9885755567")
                                                 .FontSize(9);
                                 });
-    
-                            col.Item()
-                                .Grid(grid =>
-                                {
-                                    grid.Columns(2);        // two per row
-                                    grid.Spacing(10);
 
-                                    foreach (var kvp in photoStreams)
-                                    {
-                                        var imageData = kvp.Value;
-                                        var dateText = doc.InspectionDetails.DateOfInspection
-                                                            ?.ToString("d MMM yyyy h:mm:ss tt", CultureInfo.InvariantCulture)
-                                                        ?? "";
-                                        var locText  = doc.InspectionDetails.InspectionLocation ?? "";
-
-                                        grid.Item().Column(c =>
-                                        {
-                                            // fixed‐size box
-                                            c.Item()
-                                                .Width(160)     // fixed width
-                                                .Height(120)    // fixed height
-                                                .Border(1)
-                                                .BorderColor(Colors.Blue.Darken2)
-                                                .Stack(stack =>
-                                                {
-                                                    // 1) Photo at bottom layer
-                                                    stack.Item()
-                                                        .Image(imageData, ImageScaling.FitArea);
-
-                                                    // 2) Overlay date+location at top‐left
-                                                    stack.Item()
-                                                        .Padding(5)
-                                                        .Background(Colors.Black.WithAlpha(1))  // semi‐transparent bg
-                                                        .AlignTop()
-                                                        .AlignLeft()
-                                                        .Column(txt =>
-                                                        {
-                                                            txt.Item()
-                                                                .Text(dateText)
-                                                                .FontSize(8)
-                                                                .FontColor(Colors.White);
-
-                                                            txt.Item()
-                                                                .Text(locText)
-                                                                .FontSize(8)
-                                                                .FontColor(Colors.White);
-                                                        });
-                                                });
-
-                                            // caption below
-                                            c.Item()
-                                                .PaddingTop(5)
-                                                .AlignCenter()
-                                                .Text(kvp.Key)
-                                                .FontSize(9)
-                                                .SemiBold();
-                                        });
-                                    }
-                                });
 
 
                         });
