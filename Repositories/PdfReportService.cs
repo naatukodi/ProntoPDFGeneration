@@ -22,7 +22,7 @@ namespace Valuation.Api.Services
         }
 
         [Obsolete]
-        public async Task GenerateAndShowPdf(ValuationDocument doc)
+        public async Task<byte[]> GenerateAndShowPdf(ValuationDocument doc)
         {
             // 1) Download all photos into memory so we can embed thumbnails
             var photoStreams = new Dictionary<string, byte[]>();
@@ -51,6 +51,16 @@ namespace Valuation.Api.Services
                     // ————————————————————————————————————————————————————————
                     page.Header().Row(headerRow =>
                     {
+
+                         // 1) Logo in its own constant‐width column
+                        headerRow.ConstantColumn(56)                // 60pt wide for the logo
+                        .AlignCenter()
+                        .Height(56)                        // 32pt tall
+                        .Image("./png/logo.png", ImageScaling.FitArea);
+
+                        // 2) Some spacing
+                        headerRow.ConstantColumn(10);   
+
                         // Column 1: “PRONTO MOTO SERVICES” centered
                         headerRow.RelativeColumn().AlignCenter().AlignMiddle().Row(textRow =>
                         {
@@ -107,79 +117,72 @@ namespace Valuation.Api.Services
                             .Padding(5)
                             .Table(table =>
                             {
-                                // Define 4 columns: label, value, label, value
+                                // 1) Define your four columns
                                 table.ColumnsDefinition(columns =>
                                 {
-                                    columns.ConstantColumn(140);  // left‐label
-                                    columns.RelativeColumn();     // left‐value
-                                    columns.ConstantColumn(140);  // right‐label
-                                    columns.RelativeColumn();     // right‐value
+                                    columns.ConstantColumn(140);  // left label
+                                    columns.RelativeColumn();     // left value
+                                    columns.ConstantColumn(140);  // right label
+                                    columns.RelativeColumn();     // right value
                                 });
 
-                                // Helper to write a "label" cell
-                                void AddLabel(string text)
+                                // 2) (Optional) Header row
+                                table.Header(header =>
                                 {
-                                    table.Cell()
-                                         .Padding(5)
-                                         .Text(text)
-                                         .SemiBold()
-                                         .FontSize(11);
-                                }
+                                    header.Cell().Background(Colors.Blue.Darken1).Padding(5)
+                                        .Text("FIELD").FontColor(Colors.White).SemiBold();
+                                    header.Cell().Background(Colors.Blue.Darken1).Padding(5)
+                                        .Text("VALUE").FontColor(Colors.White).SemiBold();
+                                    header.Cell().Background(Colors.Blue.Darken1).Padding(5)
+                                        .Text("FIELD").FontColor(Colors.White).SemiBold();
+                                    header.Cell().Background(Colors.Blue.Darken1).Padding(5)
+                                        .Text("VALUE").FontColor(Colors.White).SemiBold();
+                                });
 
-                                // Helper to write a "value" cell (pale‐blue background)
-                                void AddValue(string text, bool includeCalendarIcon = false)
+                                // 3) Your rows as tuples
+                                var rows = new[]
                                 {
-                                    var paleBlue = Colors.Blue.Lighten4;
-                                    var cell = table.Cell()
-                                                    .Background(paleBlue)
-                                                    .Padding(5);
+                                    ("TYPE OF VAL",           doc.TypeOfVal ?? "-",
+                                    "DATE",                  doc.CreatedAt.ToString("dd-MM-yy", CultureInfo.InvariantCulture)),
 
-                                    if (includeCalendarIcon)
-                                    {
-                                        // Show a tiny calendar emoji next to date
-                                        cell.Row(r =>
-                                        {
-                                            r.ConstantColumn(12).Text("📅");
-                                            r.ConstantColumn(5).Text(""); // spacer
-                                            r.RelativeColumn().Text(text);
-                                        });
-                                    }
-                                    else
-                                    {
-                                        cell.Text(text);
-                                    }
+                                    ("REPORT REQUESTED BY",   doc.Stakeholder.ExecutiveName ?? "-",
+                                    "BRANCH",                doc.Stakeholder.Name ?? "-"),
+
+                                    ("INSPECTION DATE",       doc.InspectionDetails.DateOfInspection.HasValue
+                                                                ? doc.InspectionDetails.DateOfInspection.Value
+                                                                    .ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
+                                                                : "-",
+                                    "REF NO",                doc.ReferenceNumber ?? "-"),
+
+                                    ("INSPECTION LOCATION",   doc.InspectionDetails.InspectionLocation ?? "-",
+                                    "REGN NO",               doc.VehicleDetails.RegistrationNumber ?? "-")
+                                };
+
+                                // 4) Iterate, optionally zebra‐stripe each row
+                                for (int i = 0; i < rows.Length; i++)
+                                {
+                                    var bg = (i % 2 == 0)
+                                        ? Colors.Grey.Lighten5   // even rows
+                                        : Colors.Grey.Lighten1;  // odd rows
+
+                                    var (l1, v1, l2, v2) = rows[i];
+
+                                    // Left label
+                                    table.Cell().Background(bg).Padding(5)
+                                        .Text(l1).FontSize(11).SemiBold();
+
+                                    // Left value (pale‐blue background for values)
+                                    table.Cell().Background(Colors.Blue.Lighten4).Padding(5)
+                                        .Text(v1).FontSize(11);
+
+                                    // Right label
+                                    table.Cell().Background(bg).Padding(5)
+                                        .Text(l2).FontSize(11).SemiBold();
+
+                                    // Right value
+                                    table.Cell().Background(Colors.Blue.Lighten4).Padding(5)
+                                        .Text(v2).FontSize(11);
                                 }
-
-                                // ───────── Row 1 ─────────
-                                AddLabel("TYPE OF VAL");
-                                AddValue(doc.TypeOfVal ?? "-");
-                                AddLabel("DATE");
-                                AddValue(
-                                    doc.dateOfValuation ??
-                                         "-",
-                                    includeCalendarIcon: true);
-
-                                // ───────── Row 2 ─────────
-                                AddLabel("REPORT REQUESTED BY");
-                                AddValue(doc.ReportRequestedBy ?? "-");
-                                AddLabel("BRANCH");
-                                AddValue(doc.VehicleDetails.Lender ?? "-");
-
-                                // ───────── Row 3 ─────────
-                                AddLabel("INSPECTION DATE");
-                                AddValue(
-                                    doc.InspectionDetails.DateOfInspection.HasValue
-                                        ? doc.InspectionDetails.DateOfInspection.Value.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
-                                        : "-",
-                                    includeCalendarIcon: true);
-                                AddLabel("REF NO");
-                                AddValue(doc.ReferenceNumber ?? "-");
-
-                                // ───────── Row 4 ─────────
-                                AddLabel("INSPECTION LOCATION");
-                                AddValue(doc.InspectionDetails.InspectionLocation ?? "-");
-                                AddLabel("REGN NO");
-                                AddValue(doc.VehicleDetails.RegistrationNumber ?? "-");
                             });
 
                         //
@@ -194,59 +197,69 @@ namespace Valuation.Api.Services
                                 //
                                 // ── LEFT COLUMN: Additional label/value table ──
                                 //
-                                row.RelativeColumn(2).Padding(5).Column(col =>
-                                {
-                                    void AddTableRow(string labelText, string valueText)
+                                row.RelativeColumn(1)
+                                    .Padding(5)
+                                    .Table(table =>
                                     {
-                                        col.Item().Table(table2 =>
+                                        // Define two columns: label + value
+                                        table.ColumnsDefinition(cd =>
                                         {
-                                            table2.ColumnsDefinition(cd =>
-                                            {
-                                                cd.ConstantColumn(140);   // Label column
-                                                cd.RelativeColumn();      // Value column
-                                            });
-
-                                            table2.Cell()
-                                                  .Background(Colors.Blue.Lighten4)
-                                                  .Padding(3)
-                                                  .Text(labelText)
-                                                  .SemiBold()
-                                                  .FontSize(11);
-
-                                            table2.Cell()
-                                                  .Background(Colors.Grey.Lighten3)
-                                                  .Padding(3)
-                                                  .Text(valueText ?? "-")
-                                                  .FontSize(11);
+                                            cd.ConstantColumn(140);
+                                            cd.RelativeColumn();
                                         });
-                                    }
 
-                                    AddTableRow("REGISTERED OWNER  👤", doc.VehicleDetails.OwnerName);
-                                    AddTableRow("APPLICANT NAME  👥", doc.Stakeholder.Applicant.Name);
-                                    AddTableRow("VEHICLE CATEGORY", doc.VehicleDetails.Model);
-                                    AddTableRow("MAKE", doc.VehicleDetails.Make);
-                                    AddTableRow("MODEL", doc.VehicleDetails.Model);
-                                    AddTableRow("CHASSIS NO  ⚙️", doc.VehicleDetails.ChassisNumber);
-                                    AddTableRow("ENGINE NO  ⚙️", doc.VehicleDetails.EngineNumber);
-                                    AddTableRow("YEAR OF MFG", doc.VehicleDetails.ManufacturedDate
-                                                                                      .HasValue
-                                                                                  ? doc.VehicleDetails.ManufacturedDate.Value.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
-                                                                                  : "-");
-                                    AddTableRow("REGISTRATION DATE", doc.VehicleDetails.DateOfRegistration
-                                                                                 .HasValue
-                                                                             ? doc.VehicleDetails.DateOfRegistration.Value.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
-                                                                             : "-");
-                                    AddTableRow("CLASS OF VEHICLE", doc.VehicleDetails.ClassOfVehicle);
-                                    AddTableRow("BODY TYPE", doc.VehicleDetails.BodyType);
-                                    AddTableRow("OWNER SR NO", doc.VehicleDetails.OwnerSerialNo?.ToString());
-                                    AddTableRow("HYPOTHECATION", doc.VehicleDetails.Hypothecation.ToString());
-                                    // … add more rows if needed …
-                                });
+                                        // Optional: set header row styling
+                                        table.Header(header =>
+                                        {
+                                            header.Cell().Background(Colors.Blue.Darken1).Padding(5)
+                                                    .Text("FIELD").FontColor(Colors.White).SemiBold();
+                                            header.Cell().Background(Colors.Blue.Darken1).Padding(5)
+                                                    .Text("VALUE").FontColor(Colors.White).SemiBold();
+                                        });
+
+                                        // Data rows (you can alternate background colors if you like)
+                                        var rows = new[]
+                                        {
+                                            ("REGISTERED OWNER", doc.VehicleDetails.OwnerName),
+                                            ("APPLICANT NAME",  doc.Stakeholder.Applicant.Name),
+                                            ("VEHICLE CATEGORY",      doc.VehicleDetails.Model),
+                                            ("MAKE",                  doc.VehicleDetails.Make),
+                                            ("MODEL",                 doc.VehicleDetails.Model),
+                                            ("CHASSIS NO ⚙️",         doc.VehicleDetails.ChassisNumber),
+                                            ("ENGINE NO ⚙️",          doc.VehicleDetails.EngineNumber),
+                                            ("YEAR OF MFG",           doc.VehicleDetails.ManufacturedDate.HasValue
+                                                                        ? doc.VehicleDetails.ManufacturedDate.Value
+                                                                                .ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
+                                                                        : "-"),
+                                            ("REGISTRATION DATE",     doc.VehicleDetails.DateOfRegistration.HasValue
+                                                                        ? doc.VehicleDetails.DateOfRegistration.Value
+                                                                                .ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
+                                                                        : "-"),
+                                            ("CLASS OF VEHICLE",       doc.VehicleDetails.ClassOfVehicle),
+                                            ("BODY TYPE",             doc.VehicleDetails.BodyType),
+                                            ("OWNER SR NO",            doc.VehicleDetails.OwnerSerialNo?.ToString()),
+                                            ("HYPOTHECATION",          doc.VehicleDetails.Hypothecation.ToString())
+                                        };
+
+                                        for (int i = 0; i < rows.Length; i++)
+                                        {
+                                            var (label, value) = rows[i];
+                                            var bg = (i % 2 == 0)
+                                                ? Colors.Grey.Lighten5   // even row
+                                                : Colors.Grey.Lighten1;  // odd row
+
+                                            table.Cell().Background(bg).Padding(5)
+                                                    .Text(label).FontSize(11).SemiBold();
+
+                                            table.Cell().Background(bg).Padding(5)
+                                                    .Text(value ?? "-").FontSize(11);
+                                        }
+                                    });
 
                                 //
                                 // ── RIGHT COLUMN: PHOTO + TIMESTAMP + CAPTION ──
                                 //
-                                row.RelativeColumn(3).Padding(5).Column(col =>
+                                row.RelativeColumn(1).Padding(5).Column(col =>
                                 {
                                     // Photo with overlay
                                     col.Item().Border(1).BorderColor(Colors.Blue.Darken2).Stack(stack =>
@@ -327,6 +340,7 @@ namespace Valuation.Api.Services
                                     .FontColor(Colors.Green.Darken1);
                             });
 
+
                         // 3.2) Icon Row (Fuel, Odometer, Colour)
                         main.Item().Row(iconRow =>
                         {
@@ -335,8 +349,8 @@ namespace Valuation.Api.Services
                             {
                                 // First set the container size, then call Image(...)
                                 col.Item()
-                                .Width(30)    // <— set container to 30px wide
-                                .Height(30)   // <— set container to 30px tall
+                                .Width(20)    // <— set container to 10px wide
+                                .Height(20)   // <— set container to 10px tall
                                 .Image("./png/fuel.png", ImageScaling.FitArea);
 
                                 col.Item()
@@ -354,8 +368,8 @@ namespace Valuation.Api.Services
                             iconRow.RelativeColumn().AlignCenter().Column(col =>
                             {
                                 col.Item()
-                                .Width(30)
-                                .Height(30)
+                                .Width(20)
+                                .Height(20)
                                 .Image("./png/odometer.jpg", ImageScaling.FitArea);
 
                                 col.Item()
@@ -375,8 +389,8 @@ namespace Valuation.Api.Services
                             iconRow.RelativeColumn().AlignCenter().Column(col =>
                             {
                                 col.Item()
-                                .Width(30)
-                                .Height(30)
+                                .Width(20)
+                                .Height(20)
                                 .Image("./png/colour.jpg", ImageScaling.FitArea);
 
                                 col.Item()
@@ -391,6 +405,38 @@ namespace Valuation.Api.Services
                             });
                         });
 
+                        // 3.7) Stamp + Signature Row
+                        main.Item().Row(row =>
+                        {
+                            // Stamp (left)
+                            row.RelativeColumn()
+                               .AlignCenter()
+                               .Width(48)
+                               .Height(48)
+                               .Image("./png/stamp.png", ImageScaling.FitArea);
+
+                            // Signature + “Approved by” text (right)
+                            row.RelativeColumn().Column(col =>
+                            {
+                                col.Item()
+                                   .AlignLeft()
+                                   .Text("Approved by")
+                                   .FontSize(10)
+                                   .FontColor(Colors.Black);
+
+                                col.Item()
+                                    .Width(48)
+                                    .Height(40)
+                                   .Image("./png/signature.png", ImageScaling.FitArea);
+
+                                col.Item()
+                                   .Text("Mahesh Garikina\nLicense No : 74183\nPronto Moto Services")
+                                   .FontSize(9)
+                                   .FontColor(Colors.Black)
+                                   .AlignLeft();
+                            });
+                        });
+
                         // 3.3) “DOCUMENT DETAILS” HEADER BAR
                         main.Item()
                             .Background(Colors.Orange.Lighten3)
@@ -401,161 +447,111 @@ namespace Valuation.Api.Services
                             .FontColor(Colors.White);
 
                         // 3.4) Permit + Insurance + Fitness + Tax sections
-                        main.Item().Table(table =>
-                        {
-                            // Two columns (Permit/Insurance on top row, Fitness/Tax on bottom row)
-                            table.ColumnsDefinition(columns =>
+                        main.Item()
+                            .Border(1)
+                            .BorderColor(Colors.Blue.Darken2)
+                            .Padding(5)
+                            .Table(table =>
                             {
-                                columns.RelativeColumn();
-                                columns.RelativeColumn();
-                            });
-
-                            // ─── Row 1: Permit (left) | Insurance (right) ───
-                            table.Cell().Column(col =>
-                            {
-                                // Section header
-                                col.Item().Background(Colors.Blue.Medium).Padding(3)
-                                   .Text("PERMIT")
-                                   .FontSize(10)
-                                   .SemiBold()
-                                   .FontColor(Colors.White);
-
-                                // Permit fields
-                                void AddDocDetail(string label, string value)
+                                // 1) Define four columns: label, value, label, value
+                                table.ColumnsDefinition(columns =>
                                 {
-                                    col.Item().Table(inner =>
-                                    {
-                                        inner.ColumnsDefinition(c =>
-                                        {
-                                            c.ConstantColumn(100);
-                                            c.RelativeColumn();
-                                        });
-                                        inner.Cell()
-                                             .Background(Colors.Blue.Lighten4)
-                                             .Padding(3)
-                                             .Text(label)
-                                             .SemiBold()
-                                             .FontSize(10);
-                                        inner.Cell()
-                                             .Background(Colors.Grey.Lighten3)
-                                             .Padding(3)
-                                             .Text(value ?? "-")
-                                             .FontSize(10);
-                                    });
+                                    columns.ConstantColumn(140);
+                                    columns.RelativeColumn();
+                                    columns.ConstantColumn(140);
+                                    columns.RelativeColumn();
+                                });
+
+                                // 2) Helper to draw a full-width category header
+                                void AddCategoryHeader(string title)
+                                {
+                                    table.Cell()
+                                        .ColumnSpan(4)
+                                        .Background(Colors.Blue.Medium)
+                                        .Padding(5)
+                                        .AlignCenter()
+                                        .Text(title)
+                                        .FontColor(Colors.White)
+                                        .FontSize(10)
+                                        .SemiBold();
                                 }
 
-                                AddDocDetail("PERMIT NO", doc.VehicleDetails.PermitNo ?? "NA");
-                                AddDocDetail("PERMIT VALID UP TO",
-                                    doc.VehicleDetails.PermitValidUpTo.HasValue
+                                // 3) Helper to add one data‐row (two label/value pairs) with optional zebra
+                                int rowIndex = 0;
+                                void AddDataRow((string Label, string Value) left, (string Label, string Value) right)
+                                {
+                                    var bg = (rowIndex++ % 2 == 0)
+                                        ? Colors.Grey.Lighten1
+                                        : Colors.Grey.Lighten5;
+
+                                    // Left label cell
+                                    table.Cell()
+                                        .Background(bg)
+                                        .Padding(5)
+                                        .Text(left.Label)
+                                        .FontSize(10)
+                                        .SemiBold();
+
+                                    // Left value cell
+                                    table.Cell()
+                                        .Background(Colors.Blue.Lighten4)
+                                        .Padding(5)
+                                        .Text(left.Value)
+                                        .FontSize(10);
+
+                                    // Right label cell
+                                    table.Cell()
+                                        .Background(bg)
+                                        .Padding(5)
+                                        .Text(right.Label)
+                                        .FontSize(10)
+                                        .SemiBold();
+
+                                    // Right value cell
+                                    table.Cell()
+                                        .Background(Colors.Blue.Lighten4)
+                                        .Padding(5)
+                                        .Text(right.Value)
+                                        .FontSize(10);
+                                }
+
+                                // ───── Permit & Insurance ─────
+                                AddCategoryHeader("PERMIT & INSURANCE");
+                                AddDataRow(
+                                    ("PERMIT NO",      doc.VehicleDetails.PermitNo    ?? "NA"),
+                                    ("POLICY NO",      doc.VehicleDetails.InsurancePolicyNo ?? "NA")
+                                );
+                                AddDataRow(
+                                    ("PERMIT VALID UP TO",
+                                        doc.VehicleDetails.PermitValidUpTo.HasValue
                                         ? doc.VehicleDetails.PermitValidUpTo.Value.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
-                                        : "NA");
-                            });
-
-                            table.Cell().Column(col =>
-                            {
-                                col.Item().Background(Colors.Blue.Medium).Padding(3)
-                                   .Text("INSURANCE")
-                                   .FontSize(10)
-                                   .SemiBold()
-                                   .FontColor(Colors.White);
-
-                                void AddInsDetail(string label, string value)
-                                {
-                                    col.Item().Table(inner =>
-                                    {
-                                        inner.ColumnsDefinition(c =>
-                                        {
-                                            c.ConstantColumn(100);
-                                            c.RelativeColumn();
-                                        });
-                                        inner.Cell()
-                                             .Background(Colors.Blue.Lighten4)
-                                             .Padding(3)
-                                             .Text(label)
-                                             .SemiBold()
-                                             .FontSize(10);
-                                        inner.Cell()
-                                             .Background(Colors.Grey.Lighten3)
-                                             .Padding(3)
-                                             .Text(value ?? "-")
-                                             .FontSize(10);
-                                    });
-                                }
-
-                                AddInsDetail("POLICY NO", doc.VehicleDetails.InsurancePolicyNo ?? "NA");
-                                AddInsDetail("VALID UP TO",
-                                    doc.VehicleDetails.InsuranceValidUpTo.HasValue
+                                        : "NA"),
+                                    ("INSURANCE VALID UP TO",
+                                        doc.VehicleDetails.InsuranceValidUpTo.HasValue
                                         ? doc.VehicleDetails.InsuranceValidUpTo.Value.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
-                                        : "NA");
-                                AddInsDetail("IDV",
-                                    doc.VehicleDetails.IDV.HasValue
-                                        ? $"₹{doc.VehicleDetails.IDV.Value:N0}"
-                                        : "NA");
+                                        : "NA")
+                                );
+                                AddDataRow(
+                                    ("IDV",  
+                                        doc.VehicleDetails.IDV.HasValue 
+                                        ? $"₹{doc.VehicleDetails.IDV.Value:N0}" 
+                                        : "NA"),
+                                    ("", "")
+                                );
+
+                                // ───── Fitness & Tax ─────
+                                AddCategoryHeader("FITNESS & TAX");
+                                AddDataRow(
+                                    ("FITNESS VALID UP TO",
+                                        doc.VehicleDetails.FitnessValidTo.HasValue
+                                        ? doc.VehicleDetails.FitnessValidTo.Value.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
+                                        : "NA"),
+                                    ("TAX VALID UP TO",
+                                        doc.VehicleDetails.TaxUpto.HasValue
+                                        ? doc.VehicleDetails.TaxUpto.Value.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
+                                        : "NA")
+                                );
                             });
-
-                            // ─── Row 2: Fitness (left) | Tax (right) ───
-                            table.Cell().Column(col =>
-                            {
-                                col.Item().Background(Colors.Blue.Medium).Padding(3)
-                                   .Text("FITNESS")
-                                   .FontSize(10)
-                                   .SemiBold()
-                                   .FontColor(Colors.White);
-
-                                col.Item().Table(inner =>
-                                {
-                                    inner.ColumnsDefinition(c =>
-                                    {
-                                        c.ConstantColumn(120);
-                                        c.RelativeColumn();
-                                    });
-                                    inner.Cell()
-                                         .Background(Colors.Blue.Lighten4)
-                                         .Padding(3)
-                                         .Text("FITNESS VALID UP TO")
-                                         .SemiBold()
-                                         .FontSize(10);
-                                    inner.Cell()
-                                         .Background(Colors.Grey.Lighten3)
-                                         .Padding(3)
-                                         .Text(doc.VehicleDetails.FitnessValidTo.HasValue
-                                             ? doc.VehicleDetails.FitnessValidTo.Value.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
-                                             : "NA")
-                                         .FontSize(10);
-                                });
-                            });
-
-                            table.Cell().Column(col =>
-                            {
-                                col.Item().Background(Colors.Blue.Medium).Padding(3)
-                                   .Text("TAX")
-                                   .FontSize(10)
-                                   .SemiBold()
-                                   .FontColor(Colors.White);
-
-                                col.Item().Table(inner =>
-                                {
-                                    inner.ColumnsDefinition(c =>
-                                    {
-                                        c.ConstantColumn(120);
-                                        c.RelativeColumn();
-                                    });
-                                    inner.Cell()
-                                         .Background(Colors.Blue.Lighten4)
-                                         .Padding(3)
-                                         .Text("VALID UP TO")
-                                         .SemiBold()
-                                         .FontSize(10);
-                                    inner.Cell()
-                                         .Background(Colors.Grey.Lighten3)
-                                         .Padding(3)
-                                         .Text(doc.VehicleDetails.TaxUpto.HasValue
-                                             ? doc.VehicleDetails.TaxUpto.Value.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
-                                             : "NA")
-                                         .FontSize(10);
-                                });
-                            });
-                        });
 
                         // 3.5) Rating Bars: Chassis Punch, Overall Rating, Valuation Amount
                         main.Item().Row(ratingRow =>
@@ -608,206 +604,166 @@ namespace Valuation.Api.Services
                                    .FontSize(10);
                             });
 
-                        // 3.7) Stamp + Signature Row
-                        main.Item().Row(row =>
-                        {
-                            // Stamp (left)
-                            row.RelativeColumn()
-                               .AlignCenter()
-                               .Width(60)
-                               .Height(60)
-                               .Image("./png/stamp.png", ImageScaling.FitArea);
-
-                            // Signature + “Approved by” text (right)
-                            row.RelativeColumn().Column(col =>
-                            {
-                                col.Item()
-                                   .AlignLeft()
-                                   .Text("Approved by")
-                                   .FontSize(10)
-                                   .FontColor(Colors.Black);
-
-                                col.Item()
-                                    .Width(60)
-                                    .Height(60)
-                                   .Image("./png/signature.png", ImageScaling.FitArea);
-
-                                col.Item()
-                                   .Text("Mahesh Garikina\nLicense No : 74183\nPronto Moto Services")
-                                   .FontSize(9)
-                                   .FontColor(Colors.Black)
-                                   .AlignLeft();
-                            });
-                        });
-
                         // ──────────────────────────────────────────────────────────────────────────────
                         // PART X: SYSTEMS INSPECTION SECTION
                         // ──────────────────────────────────────────────────────────────────────────────
                         main.Item().Row(row =>
                         {
-                            // LEFT HALF: BASIC, TRANSMISSION, COOLING, STEERING
-                            row.RelativeColumn().Padding(5).Column(col =>
+                            // ─────────────────────── LEFT HALF ───────────────────────
+                            row.RelativeColumn().Padding(5).Table(table =>
                             {
-                                // Helper to draw a category header
-                                void CategoryHeader(string title)
+                                // 1) Define two columns: label + value
+                                table.ColumnsDefinition(cd =>
                                 {
-                                    col.Item()
-                                    .Background(Colors.Blue.Medium)
-                                    .Padding(5)
-                                    .Text(title)
-                                    .FontColor(Colors.White)
-                                    .FontSize(12)
-                                    .SemiBold()
-                                    .AlignCenter();
+                                    cd.ConstantColumn(140);
+                                    cd.RelativeColumn();
+                                });
+
+                                // 2) Helper to draw a category header spanning both columns
+                                void AddCategoryHeader(string title)
+                                {
+                                    table.Cell()
+                                        .ColumnSpan(2)                           // span across both cols
+                                        .Background(Colors.Blue.Medium)
+                                        .Padding(5)
+                                        .Text(title)
+                                        .FontColor(Colors.White)
+                                        .FontSize(12)
+                                        .SemiBold()
+                                        .AlignCenter();
                                 }
 
-                                // Helper to draw a two‐column table for one category
-                                void CategoryTable(IEnumerable<(string Label, string Value)> rowsData)
+                                // 3) Helper to draw a normal data row (with optional zebra)
+                                int rowIndex = 0;
+                                void AddDataRow(string label, string value)
                                 {
-                                    col.Item().Table(table =>
-                                    {
-                                        table.ColumnsDefinition(cd =>
-                                        {
-                                            cd.ConstantColumn(140);
-                                            cd.RelativeColumn();
-                                        });
+                                    var bg = (rowIndex++ % 2 == 0)
+                                        ? Colors.Grey.Lighten1
+                                        : Colors.Grey.Lighten5;
 
-                                        foreach (var (label, value) in rowsData)
-                                        {
-                                            table.Cell().Background(Colors.Grey.Lighten3).Padding(3)
-                                                .Text(label).FontSize(10).SemiBold();
-                                            table.Cell().Background(Colors.Grey.Lighten4).Padding(3)
-                                                .Text(value ?? "-").FontSize(10);
-                                        }
-                                    });
+                                    table.Cell()
+                                        .Background(bg)
+                                        .Padding(5)
+                                        .Text(label)
+                                        .FontSize(10)
+                                        .SemiBold();
+
+                                    table.Cell()
+                                        .Background(bg)
+                                        .Padding(5)
+                                        .Text(value ?? "-")
+                                        .FontSize(10);
                                 }
 
-                                // 1) BASIC SYSTEMS
-                                CategoryHeader("BASIC SYSTEMS");
-                                CategoryTable(new[]
-                                {
-                                    ("ENGINE CONDITION",        doc.InspectionDetails.EngineCondition),
-                                    ("CHASSIS CONDITION",       doc.InspectionDetails.ChassisCondition),
-                                    ("CABIN ASSY",              doc.InspectionDetails.Cabin),
-                                    ("LOAD BODY ASSY",          doc.InspectionDetails.BodyCondition),
-                                    ("STEERING SYSTEM",         doc.InspectionDetails.SteeringAssy),
-                                    ("BRAKE SYSTEM",            doc.InspectionDetails.BrakeSystem),
-                                    ("ELECTRICAL SYSTEM",       doc.InspectionDetails.ElectricAssembly),
-                                    ("SUSPENSION SYSTEM",       doc.InspectionDetails.SuspensionSystem),
-                                    ("FUEL SYSTEM",             doc.VehicleDetails.Fuel),      // or if you have FuelSystem field
-                                    ("TYRE CONDITION",          doc.InspectionDetails.OverallTyreCondition)
-                                });
+                                // ─ BASIC SYSTEMS ─
+                                AddCategoryHeader("BASIC SYSTEMS");
+                                AddDataRow("ENGINE CONDITION",      doc.InspectionDetails.EngineCondition);
+                                AddDataRow("CHASSIS CONDITION",     doc.InspectionDetails.ChassisCondition);
+                                AddDataRow("CABIN ASSY",            doc.InspectionDetails.Cabin);
+                                AddDataRow("LOAD BODY ASSY",        doc.InspectionDetails.BodyCondition);
+                                AddDataRow("STEERING SYSTEM",       doc.InspectionDetails.SteeringAssy);
+                                AddDataRow("BRAKE SYSTEM",          doc.InspectionDetails.BrakeSystem);
+                                AddDataRow("ELECTRICAL SYSTEM",     doc.InspectionDetails.ElectricAssembly);
+                                AddDataRow("SUSPENSION SYSTEM",     doc.InspectionDetails.SuspensionSystem);
+                                AddDataRow("FUEL SYSTEM",           doc.VehicleDetails.Fuel);
+                                AddDataRow("TYRE CONDITION",        doc.InspectionDetails.OverallTyreCondition);
 
-                                // 2) TRANSMISSION SYSTEM
-                                CategoryHeader("TRANSMISSION SYSTEM");
-                                CategoryTable(new[]
-                                {
-                                    ("GEARBOX ASSY",            doc.InspectionDetails.GearBoxAssy),
-                                    ("CLUTCH SYSTEM",           doc.InspectionDetails.ClutchSystem),
-                                    ("DIFFERENTIAL ASSY",       doc.InspectionDetails.DifferentialAssy)
-                                });
+                                // ─ TRANSMISSION SYSTEM ─
+                                AddCategoryHeader("TRANSMISSION SYSTEM");
+                                AddDataRow("GEARBOX ASSY",          doc.InspectionDetails.GearBoxAssy);
+                                AddDataRow("CLUTCH SYSTEM",         doc.InspectionDetails.ClutchSystem);
+                                AddDataRow("DIFFERENTIAL ASSY",     doc.InspectionDetails.DifferentialAssy);
 
-                                // 3) COOLING SYSTEM
-                                CategoryHeader("COOLING SYSTEM");
-                                CategoryTable(new[]
-                                {
-                                    ("RADIATOR",                doc.InspectionDetails.Radiator),
-                                    ("INTER COOLER",            doc.InspectionDetails.Intercooler),
-                                    ("ALL HOSE PIPES",          doc.InspectionDetails.AllHosePipes)
-                                });
+                                // ─ COOLING SYSTEM ─
+                                AddCategoryHeader("COOLING SYSTEM");
+                                AddDataRow("RADIATOR",              doc.InspectionDetails.Radiator);
+                                AddDataRow("INTER COOLER",          doc.InspectionDetails.Intercooler);
+                                AddDataRow("ALL HOSE PIPES",        doc.InspectionDetails.AllHosePipes);
 
-                                // 4) STEERING SYSTEM
-                                CategoryHeader("STEERING SYSTEM");
-                                CategoryTable(new[]
-                                {
-                                    ("STEERING COLUMN",         doc.InspectionDetails.SteeringAssy),    // if separate
-                                    ("BRAKE SYSTEM",            doc.InspectionDetails.BrakeSystem),
-                                    ("SUSPENSION SYSTEM",       doc.InspectionDetails.SuspensionSystem)
-                                });
+                                // ─ STEERING SYSTEM ─
+                                AddCategoryHeader("STEERING SYSTEM");
+                                AddDataRow("STEERING COLUMN",       doc.InspectionDetails.SteeringAssy);
+                                AddDataRow("BRAKE SYSTEM",          doc.InspectionDetails.BrakeSystem);
+                                AddDataRow("SUSPENSION SYSTEM",     doc.InspectionDetails.SuspensionSystem);
                             });
 
-                            // RIGHT HALF: CABIN, LOAD BODY, ELECTRICAL, SUSPENSION, OTHER
-                            row.RelativeColumn().Padding(5).Column(col =>
+
+                            // ─────────────────────── RIGHT HALF ───────────────────────
+                            row.RelativeColumn().Padding(5).Table(table =>
                             {
-                                // Re-use the same helpers
-                                void CategoryHeader(string title)
+                                // same two‐column definition
+                                table.ColumnsDefinition(cd =>
                                 {
-                                    col.Item()
-                                    .Background(Colors.Blue.Medium)
-                                    .Padding(5)
-                                    .Text(title)
-                                    .FontColor(Colors.White)
-                                    .FontSize(12)
-                                    .SemiBold()
-                                    .AlignCenter();
+                                    cd.ConstantColumn(140);
+                                    cd.RelativeColumn();
+                                });
+
+                                void AddCategoryHeader(string title)
+                                {
+                                    table.Cell()
+                                        .ColumnSpan(2)
+                                        .Background(Colors.Blue.Medium)
+                                        .Padding(5)
+                                        .Text(title)
+                                        .FontColor(Colors.White)
+                                        .FontSize(12)
+                                        .SemiBold()
+                                        .AlignCenter();
                                 }
 
-                                void CategoryTable(IEnumerable<(string Label, string Value)> rowsData)
+                                int rowIndex = 0;
+                                void AddDataRow(string label, string value)
                                 {
-                                    col.Item().Table(table =>
-                                    {
-                                        table.ColumnsDefinition(cd =>
-                                        {
-                                            cd.ConstantColumn(140);
-                                            cd.RelativeColumn();
-                                        });
+                                    var bg = (rowIndex++ % 2 == 0)
+                                        ? Colors.Grey.Lighten1
+                                        : Colors.Grey.Lighten5;
 
-                                        foreach (var (label, value) in rowsData)
-                                        {
-                                            table.Cell().Background(Colors.Grey.Lighten3).Padding(3)
-                                                .Text(label).FontSize(10).SemiBold();
-                                            table.Cell().Background(Colors.Grey.Lighten4).Padding(3)
-                                                .Text(value ?? "-").FontSize(10);
-                                        }
-                                    });
+                                    table.Cell()
+                                        .Background(bg)
+                                        .Padding(5)
+                                        .Text(label)
+                                        .FontSize(10)
+                                        .SemiBold();
+
+                                    table.Cell()
+                                        .Background(bg)
+                                        .Padding(5)
+                                        .Text(value ?? "-")
+                                        .FontSize(10);
                                 }
 
-                                // 1) CABIN
-                                CategoryHeader("CABIN");
-                                CategoryTable(new[]
-                                {
-                                    ("CABIN",                   doc.InspectionDetails.Cabin),
-                                    ("DASHBOARD",               doc.InspectionDetails.Dashboard),
-                                    ("ALL GLASSES",             doc.InspectionDetails.WindshieldGlass),
-                                    ("SEATS",                   doc.InspectionDetails.Seats)
-                                });
+                                // ─ CABIN ─
+                                AddCategoryHeader("CABIN");
+                                AddDataRow("CABIN",                  doc.InspectionDetails.Cabin);
+                                AddDataRow("DASHBOARD",              doc.InspectionDetails.Dashboard);
+                                AddDataRow("ALL GLASSES",            doc.InspectionDetails.WindshieldGlass);
+                                AddDataRow("SEATS",                  doc.InspectionDetails.Seats);
 
-                                // 2) LOAD BODY
-                                CategoryHeader("LOAD BODY");
-                                CategoryTable(new[]
-                                {
-                                    ("CABIN",                   doc.InspectionDetails.Cabin),
-                                    ("SEATS",                   doc.InspectionDetails.Seats),
-                                    ("PROPELLER SHAFT",         doc.InspectionDetails.PropellerShaft),
-                                    ("BODY CONDITION",          doc.InspectionDetails.BodyCondition)
-                                });
+                                // ─ LOAD BODY ─
+                                AddCategoryHeader("LOAD BODY");
+                                AddDataRow("CABIN",                  doc.InspectionDetails.Cabin);
+                                AddDataRow("SEATS",                  doc.InspectionDetails.Seats);
+                                AddDataRow("PROPELLER SHAFT",        doc.InspectionDetails.PropellerShaft);
+                                AddDataRow("BODY CONDITION",         doc.InspectionDetails.BodyCondition);
 
-                                // 3) ELECTRICAL SYSTEM
-                                CategoryHeader("ELECTRICAL SYSTEM");
-                                CategoryTable(new[]
-                                {
-                                    ("LIGHTS",                  doc.InspectionDetails.HeadLamps),
-                                    ("BATTERY",                 doc.InspectionDetails.BatteryCondition),
-                                    ("WIRING ASSY",             doc.InspectionDetails.ElectricAssembly)
-                                });
+                                // ─ ELECTRICAL SYSTEM ─
+                                AddCategoryHeader("ELECTRICAL SYSTEM");
+                                AddDataRow("LIGHTS",                 doc.InspectionDetails.HeadLamps);
+                                AddDataRow("BATTERY",                doc.InspectionDetails.BatteryCondition);
+                                AddDataRow("WIRING ASSY",            doc.InspectionDetails.ElectricAssembly);
 
-                                // 4) SUSPENSION SYSTEM
-                                CategoryHeader("SUSPENSION SYSTEM");
-                                CategoryTable(new[]
-                                {
-                                    ("FRONT",                   doc.InspectionDetails.SuspensionSystem),  // if front/back separate
-                                    ("AXLES",                   doc.InspectionDetails.PropellerShaft)     // or other field
-                                });
+                                // ─ SUSPENSION SYSTEM ─
+                                AddCategoryHeader("SUSPENSION SYSTEM");
+                                AddDataRow("FRONT",                  doc.InspectionDetails.SuspensionSystem);
+                                AddDataRow("AXLES",                  doc.InspectionDetails.PropellerShaft);
 
-                                // 5) OTHER SYSTEMS
-                                CategoryHeader("OTHER SYSTEMS");
-                                CategoryTable(new[]
-                                {
-                                    ("AIR CONDITIONER",         doc.InspectionDetails.Intercooler),
-                                    ("PAINT WORK",              doc.InspectionDetails.PaintWork)
-                                });
+                                // ─ OTHER SYSTEMS ─
+                                AddCategoryHeader("OTHER SYSTEMS");
+                                AddDataRow("AIR CONDITIONER",        doc.InspectionDetails.Intercooler);
+                                AddDataRow("PAINT WORK",             doc.InspectionDetails.PaintWork);
                             });
                         });
+
 
                         // ──────────────────────────────────────────────────────────────────────────────
                         // PART X+: Chassis Photo, Stencil Trace, Disclaimer, Stamp+Signature, Footer
@@ -899,67 +855,104 @@ namespace Valuation.Api.Services
                             });
 
 
-                            // 5) Footer line + contact info
+                            // 5) Images + Footer line + contact info
                             col.Item().PaddingBottom(5).LineHorizontal(1).LineColor(Colors.Grey.Lighten2);
 
-                            col.Item()
-                               .Grid(grid =>
-                               {
-                                   grid.Columns(2);        // two per row
-                                   grid.Spacing(10);
+                            // col.Item()
+                            //    .Grid(grid =>
+                            //    {
+                            //        grid.Columns(2);        // two per row
+                            //        grid.Spacing(10);
 
-                                   foreach (var kvp in photoStreams)
-                                   {
-                                       var imageData = kvp.Value;
-                                       var dateText = doc.InspectionDetails.DateOfInspection
-                                                           ?.ToString("d MMM yyyy h:mm:ss tt", CultureInfo.InvariantCulture)
-                                                       ?? "";
-                                       var locText = doc.InspectionDetails.InspectionLocation ?? "";
+                            //        foreach (var kvp in photoStreams)
+                            //        {
+                            //            var imageData = kvp.Value;
+                            //            var dateText = doc.InspectionDetails.DateOfInspection
+                            //                                ?.ToString("d MMM yyyy h:mm:ss tt", CultureInfo.InvariantCulture)
+                            //                            ?? "";
+                            //            var locText = doc.InspectionDetails.InspectionLocation ?? "";
 
-                                       grid.Item().Column(c =>
-                                       {
-                                           // fixed‐size box
-                                           c.Item()
-                                               .Width(320)     // fixed width 8x4
-                                               .Height(240)    // fixed height 8x3
-                                               .Border(1)
-                                               .BorderColor(Colors.Blue.Darken2)
-                                               .Stack(stack =>
-                                               {
-                                                   // 1) Photo at bottom layer
-                                                   stack.Item()
-                                                       .Image(imageData, ImageScaling.FitArea);
+                            //            grid.Item().Column(c =>
+                            //            {
+                            //                // fixed‐size box
+                            //                c.Item()
+                            //                    .Width(160)
+                            //                    .Height(120)    // fixed height 4x3
+                            //                    .Border(1)
+                            //                    .BorderColor(Colors.Blue.Darken2)
+                            //                    .Stack(stack =>
+                            //                    {
+                            //                        // 1) Photo at bottom layer
+                            //                        stack.Item()
+                            //                            .Image(imageData, ImageScaling.FitArea);
 
-                                                   // 2) Overlay date+location at top‐left
-                                                   stack.Item()
-                                                       .Padding(5)
-                                                       .Background(Colors.Black.WithAlpha(1))  // semi‐transparent bg
-                                                       .AlignTop()
-                                                       .AlignLeft()
-                                                       .Column(txt =>
-                                                       {
-                                                           txt.Item()
-                                                               .Text(dateText)
-                                                               .FontSize(8)
-                                                               .FontColor(Colors.White);
+                            //                        // 2) Overlay date+location at top‐left
+                            //                        stack.Item()
+                            //                            .Padding(5)
+                            //                            .Background(Colors.Black.WithAlpha(1))  // semi‐transparent bg
+                            //                            .AlignTop()
+                            //                            .AlignLeft()
+                            //                            .Column(txt =>
+                            //                            {
+                            //                                txt.Item()
+                            //                                    .Text(dateText)
+                            //                                    .FontSize(8)
+                            //                                    .FontColor(Colors.White);
 
-                                                           txt.Item()
-                                                               .Text(locText)
-                                                               .FontSize(8)
-                                                               .FontColor(Colors.White);
-                                                       });
-                                               });
+                            //                                txt.Item()
+                            //                                    .Text(locText)
+                            //                                    .FontSize(8)
+                            //                                    .FontColor(Colors.White);
+                            //                            });
+                            //                    });
 
-                                           // caption below
-                                           c.Item()
-                                               .PaddingTop(5)
-                                               .AlignCenter()
-                                               .Text(kvp.Key)
-                                               .FontSize(9)
-                                               .SemiBold();
-                                       });
-                                   }
-                               });
+                            //                // caption below
+                            //                c.Item()
+                            //                    .PaddingTop(5)
+                            //                    .AlignCenter()
+                            //                    .Text(kvp.Key)
+                            //                    .FontSize(9)
+                            //                    .SemiBold();
+                            //            });
+                            //        }
+                            //    });
+
+                            // 2g) PHOTOS & MEDIA SECTION
+                        col.Item().PaddingTop(5).Text("Photos").Bold();
+                        col.Item().Grid(grid =>
+                                    {
+                                        grid.Columns(3);
+                                        grid.Spacing(10);
+
+                                        foreach (var kvp in photoStreams)
+                                        {
+                                            var imageName = kvp.Key;
+                                            var imageData = kvp.Value;
+
+                                            // Look up the CDN URL for this image name
+                                            var cdnUrl = doc.PhotoUrls.ContainsKey(imageName)
+                                                ? doc.PhotoUrls[imageName]
+                                                : string.Empty;
+
+                                            grid.Item().Column(imgCol =>
+                                            {
+                                                // 1) Thumbnail with hyperlink
+                                                imgCol.Item()
+                                                    .Hyperlink(cdnUrl)               // <- make the image clickable
+                                                    .Width(80)
+                                                    .Height(80)
+                                                    .Image(imageData, ImageScaling.FitArea);
+
+                                                // 2) Caption with hyperlink as well
+                                                imgCol.Item()
+                                                    .Hyperlink(cdnUrl)               // <- clicking the text also jumps
+                                                    .Text(imageName)
+                                                    .FontSize(9)
+                                                    .Italic()
+                                                    .AlignCenter();
+                                            });
+                                        }
+                                    });
 
 
                         });
@@ -968,7 +961,6 @@ namespace Valuation.Api.Services
                         // 3.8) Disclaimer + Icons Footer
                         main.Item().Column(col =>
                         {
-                            col.Item().PaddingTop(20);
 
                             // Disclaimer
                             col.Item()
@@ -978,11 +970,11 @@ namespace Valuation.Api.Services
                                .AlignCenter();
 
                             // Thin gray separator
-                            col.Item().LineHorizontal(1);
-                            col.Item().BorderColor(Colors.Grey.Lighten2)
-                                      .Height(1)
-                                      .PaddingVertical(5);
-                            col.Item().Padding(5);
+                            // Remove vertical padding entirely:
+                            col.Item()
+                                .Border(1)
+                                .BorderColor(Colors.Grey.Lighten2)
+                                .Height(1);
 
                             // Address + contact icons
                             col.Item().Row(footerRow =>
@@ -1032,10 +1024,10 @@ namespace Valuation.Api.Services
             });
 
             // 3) Show the live preview in QuestPDF Companion
-            pdfDoc.ShowInCompanion();
+            //pdfDoc.ShowInCompanion();
 
             // 4) (Optional) Generate PDF bytes if you need them:
-            // byte[] pdfBytes = pdfDoc.GeneratePdf();
+            return pdfDoc.GeneratePdf();
         }
     }
 }

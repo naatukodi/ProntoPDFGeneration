@@ -155,7 +155,7 @@ namespace Valuation.Api.Services;
                     OverallRating = "Good",
                     ValuationAmount = 40000,
                     ChassisPunch = "Good",
-                    Remarks = null
+                    Remarks = "Vehicle is found in good road worthy condition.2.Vehicle inspected with open chassis(no load body/platform available)"
                 },
 
                 // ── ValuationResponse sub‐object ────────────────────────────────────────────────
