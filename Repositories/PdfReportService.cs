@@ -1,24 +1,48 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.Http;
-using System.Threading.Tasks;
 using System.Globalization;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
 using QuestPDF.Infrastructure;
-using QuestPDF.Companion;
 using Valuation.Api.Models;
+using Microsoft.Azure.Cosmos;
+using System.Net;
 
 namespace Valuation.Api.Services
 {
     public class PdfReportService
     {
+        private readonly CosmosClient _cosmos;
+        private readonly string _dbId;
+        private readonly string _containerId;
+
+        private Container Container => _cosmos.GetDatabase(_dbId).GetContainer(_containerId);
+
+        private PartitionKey GetPk(string vehicleNumber, string applicantContact) =>
+            new($"{vehicleNumber}|{applicantContact}");  // use colon delimiter for composite key
+
         private readonly HttpClient _httpClient;
 
-        public PdfReportService(HttpClient httpClient)
+        public PdfReportService(HttpClient httpClient, CosmosClient cosmos, IConfiguration configuration)
         {
             _httpClient = httpClient;
+            _cosmos = cosmos;
+            _dbId = configuration["Cosmos:DatabaseId"] ?? "ValuationsDb";
+            _containerId = configuration["Cosmos:ContainerId"] ?? "Valuations";
+        }
+
+        public async Task<ValuationDocument?> GetValuationDocumentAsync(
+        string valuationId, string vehicleNumber, string applicantContact)
+        {
+            try
+            {
+                var resp = await Container.ReadItemAsync<ValuationDocument>(
+                    id: valuationId,
+                    partitionKey: GetPk(vehicleNumber, applicantContact));
+                return resp.Resource;
+            }
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                return null;
+            }
         }
 
         [Obsolete]
@@ -107,7 +131,7 @@ namespace Valuation.Api.Services
                     // SINGLE CONTENT LAYER: PART 1 + PART 2 + PART 3
                     // ————————————————————————————————————————————————————————
                     page.Content().PaddingVertical(10).Column(main =>
-                    {
+                    {   
                         //
                         // ───────── Part 1: Four‐row, four‐column table ─────────
                         //
