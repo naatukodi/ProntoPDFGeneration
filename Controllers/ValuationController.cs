@@ -23,8 +23,8 @@ public class ValuationController : ControllerBase
         if (doc == null)
             return NotFound();
 
-        // await the new bytes‐returning method:
-        byte[] pdfbytes = await _pdfService.GenerateAndShowPdf(doc);
+        // Updated method name here
+        byte[] pdfbytes = await _pdfService.GeneratePdfAsync(doc);
 
         var fileName = $"{id}_{DateTime.UtcNow:yyyyMMdd}.pdf";
         return File(pdfbytes, "application/pdf", fileName);
@@ -36,17 +36,14 @@ public class ValuationController : ControllerBase
         [FromQuery] string vehicleNumber,
         [FromQuery] string applicantContact)
     {
-        // 1) Fetch the FinalReport object from your repository
         var report = await _pdfService.GetValuationDocumentAsync(id.ToString(), vehicleNumber, applicantContact);
         if (report == null)
             return NotFound();
 
-        // 2) Generate PDF bytes
-        byte[] pdfBytes = await _pdfService.GenerateAndShowPdf(report);
+        // Updated method name here
+        byte[] pdfBytes = await _pdfService.GeneratePdfAsync(report);
 
-        // 3) Return as a file result
         string fileName = $"{vehicleNumber}_{System.DateTime.UtcNow:yyyyMMdd}.pdf";
-
         return File(pdfBytes, "application/pdf", fileName);
     }
 }
