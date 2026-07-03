@@ -1,21 +1,24 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Azure.Storage.Blobs;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.Configuration;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
 using QuestPDF.Infrastructure;
+using SkiaSharp;
 using Valuation.Api.Models;
 using QRCoder;
-using System.IO;
 
 namespace Valuation.Api.Services
 {
@@ -25,6 +28,8 @@ namespace Valuation.Api.Services
         private readonly string _dbId;
         private readonly string _containerId;
         private readonly HttpClient _httpClient;
+        private readonly BlobContainerClient? _blobContainer;
+        private readonly string? _blobBaseUrl;
 
         // Master Brand Colors matched to original design
         private static readonly string BrandTeal  = "#009688";
@@ -45,6 +50,12 @@ namespace Valuation.Api.Services
             _dbId          = configuration["Cosmos:DatabaseId"]    ?? "ValuationsDb";
             _containerId   = configuration["Cosmos:ContainerId"]   ?? "Valuations";
             QuestPDF.Settings.License = LicenseType.Community;
+
+            var blobConnStr   = configuration["BlobStorage:ConnectionString"];
+            var blobContainer = configuration["BlobStorage:ContainerName"] ?? "reports";
+            _blobBaseUrl      = configuration["BlobStorage:BaseUrl"];
+            if (!string.IsNullOrWhiteSpace(blobConnStr))
+                _blobContainer = new BlobContainerClient(blobConnStr, blobContainer);
         }
 
         public async Task<ValuationDocument?> GetValuationDocumentAsync(
@@ -67,7 +78,29 @@ namespace Valuation.Api.Services
         {
             var referenceNumber = GenerateReferenceNumber(doc);
             var photoStreams     = await DownloadPhotosAsync(doc.PhotoUrls);
-            var qrCodeBytes      = GenerateQRCode($"https://prontofirebase.web.app/verify/{referenceNumber}");
+
+            // Fallback: chassis photos may be stored on InspectionDetails instead of PhotoUrls
+            var ins = doc.InspectionDetails;
+            if (ins != null)
+            {
+                if (!photoStreams.ContainsKey("ChassisVerification") && !string.IsNullOrEmpty(ins.ChassisVerificationPhotoUrl))
+                {
+                    var bytes = await TryDownloadUrl(ins.ChassisVerificationPhotoUrl);
+                    if (bytes != null) photoStreams["ChassisVerification"] = bytes;
+                }
+                if (!photoStreams.ContainsKey("ChassisStencilTrace") && !string.IsNullOrEmpty(ins.ChassisStencilTracePhotoUrl))
+                {
+                    var bytes = await TryDownloadUrl(ins.ChassisStencilTracePhotoUrl);
+                    if (bytes != null) photoStreams["ChassisStencilTrace"] = bytes;
+                }
+            }
+
+            // QR points to the stored original PDF in blob (tamper-proof) if configured,
+            // otherwise falls back to the Firebase verify page.
+            string qrUrl = (_blobContainer != null && !string.IsNullOrWhiteSpace(_blobBaseUrl))
+                ? $"{_blobBaseUrl.TrimEnd('/')}/{_blobContainer.Name}/{referenceNumber}.pdf"
+                : $"https://prontofirebase.web.app/verify/{referenceNumber}";
+            var qrCodeBytes = GenerateQRCode(qrUrl);
 
             var pdfDoc = QuestPDF.Fluent.Document.Create(container =>
             {
@@ -99,7 +132,22 @@ namespace Valuation.Api.Services
                 });
             });
 
-            return pdfDoc.GeneratePdf();
+            var pdfBytes = pdfDoc.GeneratePdf();
+
+            // Upload original PDF to blob storage so QR scan always returns the unedited version
+            if (_blobContainer != null)
+            {
+                try
+                {
+                    await _blobContainer.CreateIfNotExistsAsync(Azure.Storage.Blobs.Models.PublicAccessType.Blob);
+                    var blobClient = _blobContainer.GetBlobClient($"{referenceNumber}.pdf");
+                    using var ms = new MemoryStream(pdfBytes);
+                    await blobClient.UploadAsync(ms, overwrite: true);
+                }
+                catch { /* fail silently — PDF is still returned even if upload fails */ }
+            }
+
+            return pdfBytes;
         }
 
         // ──────────────────────────────────────────────
@@ -224,6 +272,19 @@ namespace Valuation.Api.Services
             return result;
         }
 
+        private async Task<byte[]?> TryDownloadUrl(string url)
+        {
+            try
+            {
+                using var cts  = new CancellationTokenSource(PhotoDownloadTimeout);
+                var resp       = await _httpClient.GetAsync(url, cts.Token);
+                if (resp.IsSuccessStatusCode)
+                    return await resp.Content.ReadAsByteArrayAsync();
+            }
+            catch { }
+            return null;
+        }
+
         private byte[] GenerateQRCode(string text)
         {
             try
@@ -266,10 +327,10 @@ namespace Valuation.Api.Services
                 var v = MapVerdict(item.Value);
                 switch (v)
                 {
-                    case "GOOD": case "YES": scores.Add(10.0); break;
-                    case "AVERAGE":          scores.Add(6.5);  break;
-                    case "POOR": case "BAD": scores.Add(3.0);  break;
-                    case "NO":               scores.Add(4.0);  break;
+                    case "GOOD": case "YES": scores.Add(8.5); break; // GOOD = 7-10 range → 8.5
+                    case "AVERAGE":          scores.Add(5.5); break; // AVERAGE = 4-7 range → 5.5
+                    case "POOR": case "BAD": scores.Add(2.5); break; // POOR = 1-4 range → 2.5
+                    case "NO":               scores.Add(1.0); break;
                     case "NA": break;
                     default:
                         var m = Regex.Match(v, @"\d+(\.\d+)?");
@@ -283,14 +344,47 @@ namespace Valuation.Api.Services
 
         private (string Score, string Color) GetScoreDisplayFromDouble(double score)
         {
-            var c = score >= 8.0 ? MintText
-                  : score >= 6.0 ? "#D97706"
-                  : "#DC2626";
+            var c = score >= 7.0 ? MintText    // GOOD range
+                  : score >= 4.0 ? "#D97706"   // AVERAGE range
+                  : "#DC2626";                  // POOR range
             return ($"{score.ToString("F1", CultureInfo.InvariantCulture)}/10", c);
         }
 
         private string SafeFormat(string? value, string def = "-") =>
             string.IsNullOrWhiteSpace(value) ? def : value;
+
+        // Indian number format: ₹ 14,00,000 instead of ₹ 1,400,000
+        private static string FormatIndianCurrency(decimal amount) =>
+            amount.ToString("N0", new CultureInfo("en-IN"));
+
+        private static readonly HashSet<string> _conditionWords = new(StringComparer.OrdinalIgnoreCase)
+            { "good", "bad", "poor", "average", "na", "yes", "no", "ok", "fair", "true", "false", "1", "0", "qc", "avo", "backend" };
+
+        // Returns the actual approver name, falling back through document fields
+        // if VehicleInspectedBy was accidentally stored as a condition value
+        private string ResolveApprovedByName(ValuationDocument doc)
+        {
+            var name = doc.InspectionDetails?.VehicleInspectedBy?.Trim();
+            if (!string.IsNullOrWhiteSpace(name) && !_conditionWords.Contains(name))
+                return name;
+            return doc.CompletedBy ?? doc.UpdatedBy ?? doc.AssignedTo ?? "Jagadeesh Kumar";
+        }
+
+        // ManufacturedDate is often null; fall back to YearOfMfg + MonthOfMfg integers from Vahan
+        private static string ResolveMfgYear(VehicleDetailsDto? vd)
+        {
+            if (vd == null) return "-";
+            if (vd.ManufacturedDate.HasValue)
+                return vd.ManufacturedDate.Value.ToString("MMM-yyyy", CultureInfo.InvariantCulture).ToUpper();
+            if (vd.YearOfMfg.HasValue)
+            {
+                if (vd.MonthOfMfg is > 0 and <= 12)
+                    return new DateTime(vd.YearOfMfg.Value, vd.MonthOfMfg.Value, 1)
+                        .ToString("MMM-yyyy", CultureInfo.InvariantCulture).ToUpper();
+                return vd.YearOfMfg.Value.ToString();
+            }
+            return "-";
+        }
 
         // ──────────────────────────────────────────────
         // Header
@@ -302,15 +396,19 @@ namespace Valuation.Api.Services
             {
                 row.RelativeItem().Column(col =>
                 {
-                    col.Item().Height(40).AlignLeft().Row(logoRow =>
+                    col.Item().Height(34).AlignLeft().Row(logoRow =>
                     {
-                        var absolutePath = Path.Combine(AppContext.BaseDirectory, "png", "vehga-logo.png");
-                        if (File.Exists(absolutePath))
-                            logoRow.AutoItem().Height(40).Image(absolutePath).FitHeight();
-                        else if (File.Exists("png/vehga-logo.png"))
-                            logoRow.AutoItem().Height(40).Image("png/vehga-logo.png").FitHeight();
+                        var trimmedPath   = Path.Combine(AppContext.BaseDirectory, "png", "vehga-logo-trimmed.png");
+                        var absolutePath  = Path.Combine(AppContext.BaseDirectory, "png", "vehga-logo.png");
+                        string? logoPath  = File.Exists(trimmedPath)  ? trimmedPath
+                                          : File.Exists(absolutePath) ? absolutePath
+                                          : File.Exists("png/vehga-logo-trimmed.png") ? "png/vehga-logo-trimmed.png"
+                                          : File.Exists("png/vehga-logo.png")         ? "png/vehga-logo.png"
+                                          : null;
+                        if (logoPath != null)
+                            logoRow.ConstantItem(140).Height(34).Image(logoPath).FitArea();
                         else
-                            logoRow.AutoItem().Text("VEHGA").FontSize(26).Bold().FontColor(BrandTeal);
+                            logoRow.AutoItem().Text("VEHGA").FontSize(24).Bold().FontColor(BrandTeal);
                     });
                 });
                 row.AutoItem().AlignRight().Column(col =>
@@ -341,7 +439,7 @@ namespace Valuation.Api.Services
         private void ComposeFooter(IContainer container, ValuationDocument doc)
         {
             container.PaddingTop(4).BorderTop(1).BorderColor("#E2E8F0").PaddingTop(6).AlignCenter()
-                .Text("NOTE: THIS IS A DIGITALLY GENERATED REPORT, HENCE NO PHYSICAL SIGNATURE IS REQUIRED. VERIFIED VIA PRONTO SECURE CLOUD.")
+                .Text("NOTE: THIS IS A DIGITALLY GENERATED REPORT, HENCE NO PHYSICAL SIGNATURE IS REQUIRED. VERIFIED VIA VEHGA SECURE CLOUD.")
                 .FontSize(5.5f).FontColor(LabelSlate).LetterSpacing(0.03f);
         }
 
@@ -383,7 +481,7 @@ namespace Valuation.Api.Services
                     });
                     
                     layers.PrimaryLayer().PaddingVertical(5).PaddingLeft(16).PaddingRight(12)
-                        .Text("RETAIL").FontSize(8).Bold().FontColor(Colors.White);
+                        .Text((doc.Stakeholder?.ValuationType ?? "RETAIL").ToUpper()).FontSize(8).Bold().FontColor(Colors.White);
                 });
             });
 
@@ -395,8 +493,9 @@ namespace Valuation.Api.Services
                     {
                         l.PrimaryLayer().Element(c =>
                         {
-                            byte[]? img = photos.GetValueOrDefault("FrontLeftSide")
+                            byte[]? img = photos.GetValueOrDefault("FrontViewGrille")
                                        ?? photos.GetValueOrDefault("FrontView")
+                                       ?? photos.GetValueOrDefault("FrontLeftSide")
                                        ?? photos.Values.FirstOrDefault();
                             if (img != null)
                                 c.AlignCenter().AlignMiddle().Image(img).FitArea();
@@ -424,9 +523,9 @@ namespace Valuation.Api.Services
                             string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
                             return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""8"" fill=""#E6F5F3""/></svg>";
                         });
-                        layers.PrimaryLayer().PaddingVertical(5).AlignCenter()
-                            .Text(vehicleName.Length > 35 ? vehicleName[..35].TrimEnd() + "…" : vehicleName)
-                            .FontSize(vehicleName.Length > 28 ? 9 : 10).ExtraBold().FontColor(BrandTeal);
+                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(6).AlignCenter()
+                            .Text(vehicleName)
+                            .FontSize(8).ExtraBold().FontColor(BrandTeal);
                     });
                 });
 
@@ -448,7 +547,7 @@ namespace Valuation.Api.Services
                                 .FontSize(8).ExtraBold().FontColor(BrandTeal).LetterSpacing(0.04f);
 
                             var gaugeScore = ParseScoreValue(doc.QualityControl?.OverallRating);
-                            c.Item().AlignCenter().Height(88)
+                            c.Item().AlignCenter().Height(82)
                                 .Svg(size => GenerateScoreGaugeSvg(size, gaugeScore));
 
                             c.Item().AlignCenter().PaddingTop(2).Layers(badgeLayers =>
@@ -479,7 +578,7 @@ namespace Valuation.Api.Services
                                 .Text("ESTIMATED MARKET VALUE")
                                 .FontSize(8).Bold().FontColor(Colors.White).LetterSpacing(0.04f);
                             c.Item().PaddingTop(6).AlignCenter()
-                                .Text($"₹ {doc.QualityControl?.ValuationAmount:N0}")
+                                .Text($"₹ {FormatIndianCurrency(doc.QualityControl?.ValuationAmount ?? 0)}")
                                 .FontSize(22).ExtraBold().FontColor(Colors.White);
                             c.Item().PaddingTop(4).AlignCenter()
                                 .Text("Calculated based on current market trends")
@@ -489,7 +588,7 @@ namespace Valuation.Api.Services
                 });
             });
 
-            main.Item().PaddingVertical(4); 
+            main.Item().PaddingVertical(2);
 
             main.Item().BorderTop(1).BorderBottom(1).BorderColor("#E5E7EB")
                 .PaddingVertical(5).Table(table => 
@@ -509,7 +608,7 @@ namespace Valuation.Api.Services
                     doc.InspectionDetails?.InspectionLocation?.ToUpper() ?? "-");
             });
 
-            main.Item().PaddingVertical(4); 
+            main.Item().PaddingVertical(2);
 
             DrawSectionTitle(main.Item(), "ASSET IDENTITY",
                 @"<path d=""M18.92 6.01C18.72 5.42 18.16 5 17.5 5h-11c-.66 0-1.21.42-1.42 1.01L3 12v8c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h12v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-8l-2.08-5.99zM6.5 16c-.83 0-1.5-.67-1.5-1.5S5.67 13 6.5 13s1.5.67 1.5 1.5S7.33 16 6.5 16zm11 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zM5 11l1.5-4.5h11L19 11H5z""/>",
@@ -526,16 +625,16 @@ namespace Valuation.Api.Services
                 AddAssetRow(table, "OWNER",            doc.VehicleDetails?.OwnerName?.ToUpper() ?? "-",      "FUEL TYPE",         doc.VehicleDetails?.Fuel?.ToUpper() ?? "-");
                 AddAssetRow(table, "APPLICANT",        doc.Stakeholder?.Applicant?.Name?.ToUpper() ?? "-",   "TRANSMISSION",      "MANUAL");
                 AddAssetRow(table, "CHASSIS NUMBER",   doc.VehicleDetails?.ChassisNumber?.ToUpper() ?? "-",  "COLOUR",            doc.VehicleDetails?.Colour?.ToUpper() ?? "-");
-                AddAssetRow(table, "ENGINE NUMBER",    doc.VehicleDetails?.EngineNumber?.ToUpper() ?? "-",   "ODO METER",         doc.VehicleDetails?.Odometer?.ToString() ?? "-");
+                AddAssetRow(table, "ENGINE NUMBER",    doc.VehicleDetails?.EngineNumber?.ToUpper() ?? "-",   "ODO METER",         doc.VehicleDetails?.Odometer?.ToString() ?? doc.InspectionDetails?.Odometer?.ToString() ?? "-");
                 AddAssetRow(table, "MANUFACTURE YEAR",
-                    doc.VehicleDetails?.ManufacturedDate?.ToString("MMM-yyyy", CultureInfo.InvariantCulture)?.ToUpper() ?? "-",
+                    ResolveMfgYear(doc.VehicleDetails),
                     "VEHICLE TYPE",      doc.VehicleDetails?.ClassOfVehicle?.ToUpper() ?? "-");
                 AddAssetRow(table, "REGISTERED ON",
                     doc.VehicleDetails?.DateOfRegistration?.ToString("dd-MMM-yyyy", CultureInfo.InvariantCulture)?.ToUpper() ?? "-",
                     "OWNERSHIP NUMBER",  doc.VehicleDetails?.OwnerSerialNo?.ToString() ?? "1");
             });
 
-            main.Item().PaddingVertical(5);
+            main.Item().PaddingVertical(3);
 
             main.Item().Row(outerRow =>
             {
@@ -673,7 +772,7 @@ namespace Valuation.Api.Services
                     });
                     layers.PrimaryLayer().MinHeight(75).Padding(12).Column(c =>
                     {
-                        c.Item().Text("INSPECTOR'S REMARKS")
+                        c.Item().Text("REMARKS")
                             .FontSize(8).ExtraBold().FontColor(LabelSlate).LetterSpacing(0.06f);
                         c.Item().PaddingTop(6)
                             .Text($"\"{doc.QualityControl?.Remarks ?? "Vehicle found in good road worthy condition."}\"")
@@ -711,7 +810,7 @@ namespace Valuation.Api.Services
                         .FontSize(8).FontColor(LabelSlate);
 
                     col.Item().PaddingTop(2).AlignRight()
-                        .Text(doc.InspectionDetails?.VehicleInspectedBy ?? "Jagadeesh Kumar")
+                        .Text("Mahesh Garikina")
                         .FontSize(12).SemiBold().FontColor(ValueDark);
 
                     col.Item().PaddingTop(1).AlignRight()
@@ -786,7 +885,7 @@ namespace Valuation.Api.Services
             {
                 int i = 0;
                 AddVahanRow(col, i++, "REGISTRATION NUMBER",  vd?.RegistrationNumber,           "OWNER SERIAL NUMBER",   vd?.OwnerSerialNo?.ToString() ?? "1");
-                AddVahanRow(col, i++, "CHASSIS NUMBER",        vd?.ChassisNumber,                "YEAR OF MANUFACTURE",   vd?.ManufacturedDate?.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture));
+                AddVahanRow(col, i++, "CHASSIS NUMBER",        vd?.ChassisNumber,                "YEAR OF MANUFACTURE",   ResolveMfgYear(vd));
                 AddVahanRow(col, i++, "ENGINE NUMBER",         vd?.EngineNumber,                 "DATE OF REGISTRATION",  vd?.DateOfRegistration?.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture));
                 AddVahanRow(col, i++, "VEHICLE MAKE",          vd?.Make,                         "ENGINE CUBIC CAPACITY", $"{vd?.EngineCC ?? 0} CC");
                 AddVahanRow(col, i++, "VEHICLE MODEL",         vd?.Model,                        "GROSS VEHICLE WEIGHT",  $"{vd?.GrossVehicleWeight ?? 0} KG");
@@ -814,7 +913,7 @@ namespace Valuation.Api.Services
                 AddRegulatoryCardSimple(col, "NATIONAL PERMIT", "AP123456789", "ACTIVE", "EXP: OCT 2028");
                 AddRegulatoryCardSimple(col, "FITNESS CERTIFICATE", "", "---", "EXP: ---", true);
                 AddRegulatoryCardWithPhoto(col, "CHASSIS VERIFICATION",  "VERIFIED", photos, "ChassisVerification");
-                AddRegulatoryCardWithPhoto(col, "CHASSIS STENCIL TRACE", "",         photos, "ChassisImprint");
+                AddRegulatoryCardWithPhoto(col, "CHASSIS STENCIL TRACE", "",         photos, "ChassisStencilTrace");
             });
         }
 
@@ -867,6 +966,25 @@ namespace Valuation.Api.Services
             });
         }
 
+        private static byte[] CropCenterFocus(byte[] imageBytes, float widthRatio = 0.80f, float heightRatio = 0.55f)
+        {
+            try
+            {
+                using var original = SKBitmap.Decode(imageBytes);
+                if (original == null) return imageBytes;
+                int cropW = (int)(original.Width  * widthRatio);
+                int cropH = (int)(original.Height * heightRatio);
+                int x = (original.Width  - cropW) / 2;
+                int y = (original.Height - cropH) / 2;
+                using var cropped = new SKBitmap(cropW, cropH);
+                original.ExtractSubset(cropped, new SKRectI(x, y, x + cropW, y + cropH));
+                using var image = SKImage.FromBitmap(cropped);
+                using var data  = image.Encode(SKEncodedImageFormat.Jpeg, 92);
+                return data.ToArray();
+            }
+            catch { return imageBytes; }
+        }
+
         private void AddRegulatoryCardWithPhoto(ColumnDescriptor col,
             string title, string details, Dictionary<string, byte[]> photos, string photoKey)
         {
@@ -888,17 +1006,18 @@ namespace Valuation.Api.Services
                                         <polyline points=""7,12.5 10.5,16 17,8"" fill=""none"" stroke=""{BrandTeal}"" stroke-width=""1.5""/>
                                      </svg>");
 
-                    row.RelativeItem(1).AlignMiddle().Column(c =>
+                    row.RelativeItem(3).AlignMiddle().Column(c =>
                     {
                         c.Item().Text(title).FontSize(9).Bold().FontColor(ValueDark);
                         if (!string.IsNullOrEmpty(details))
                             c.Item().PaddingTop(3).Text(details).FontSize(7).FontColor(LabelSlate);
                     });
 
-                    row.RelativeItem(1).AlignMiddle().AlignRight().Element(c =>
+                    row.RelativeItem(7).AlignMiddle().AlignRight().Element(c =>
                     {
-                        byte[]? photo = photos.GetValueOrDefault(photoKey)
-                                     ?? photos.GetValueOrDefault("ChassisNumberPlate");
+                        byte[]? raw = photos.GetValueOrDefault(photoKey)
+                                   ?? photos.GetValueOrDefault("ChassisNumberPlate");
+                        byte[]? photo = raw != null ? CropCenterFocus(raw) : null;
                         if (photo != null)
                             c.Height(45).AlignCenter().AlignMiddle().Image(photo).FitArea();
                         else
@@ -912,6 +1031,393 @@ namespace Valuation.Api.Services
         // PAGE 3 — System Scores
         // ──────────────────────────────────────────────
 
+        // ── PDF inspection-field registry (mirrors inspection-field-registry.ts) ──
+        private record FieldDef(string Label, string Key);
+        private record SectionDef(string Name, FieldDef[] Fields);
+
+        private static readonly Dictionary<string, SectionDef[]> PdfFieldRegistry = new()
+        {
+            ["cv"] = new SectionDef[]
+            {
+                new("BASIC SYSTEMS", new FieldDef[] {
+                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
+                    new("CABIN ASSY","cabinAssy"),             new("LOAD BODY ASSY","loadBodyAssy"),
+                    new("STEERING SYSTEM","steeringSystem"),   new("BRAKE SYSTEM","brakeSystem"),
+                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
+                    new("FUEL SYSTEM","fuelSystem"),           new("TYRE CONDITION","tyreCondition"),
+                }),
+                new("CABIN ASSEMBLY", new FieldDef[] {
+                    new("CABIN","cabin"), new("DASHBOARD","dashboard"),
+                    new("DOORS","doors"), new("ALL GLASSES","allGlasses"), new("SEATS","seats"),
+                }),
+                new("LOAD BODY", new FieldDef[] {
+                    new("RIGHT SIDE GATE","rightSideGate"), new("LEFT SIDE GATE","leftSideGate"),
+                    new("TAIL GATE","tailGate"),            new("LOAD FLOOR","loadFloor"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
+                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
+                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
+                }),
+                new("COOLING SYSTEM", new FieldDef[] {
+                    new("RADIATOR","radiator"), new("INTER COOLER","intercooler"),
+                    new("ALL HOSE PIPES","allHosePipes"),
+                }),
+                new("TRANSMISSION SYSTEM", new FieldDef[] {
+                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
+                    new("DIFFERENTIAL ASSY","differentialAssy"),
+                }),
+                new("STEERING SYSTEM", new FieldDef[] {
+                    new("STEERING WHEEL","steeringWheel"), new("STEERING COLUMN","steeringColumn"),
+                    new("STEERING BOX","steeringBox"),
+                }),
+                new("SUSPENSION SYSTEM", new FieldDef[] {
+                    new("FRONT SUSPENSION","frontSuspension"), new("REAR SUSPENSION","rearSuspension"),
+                    new("FRONT & REAR AXLES","axles"),
+                }),
+                new("OTHER SYSTEMS", new FieldDef[] {
+                    new("AIR CONDITIONER","airConditioner"), new("AUDIO","audio"),
+                    new("UPHOLSTERY","upholstery"),          new("HYDRAULIC LIFT","hydraulicLift"),
+                    new("FRONT CRASH GUARD","frontCrashGuard"), new("REAR CRASH GUARD","rearCrashGuard"),
+                    new("SIDE UNDER RUN PROTECTION","sideUnderRunProtection"), new("PAINT WORK","paintWork"),
+                }),
+            },
+            ["4w"] = new SectionDef[]
+            {
+                new("BASIC SYSTEMS", new FieldDef[] {
+                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
+                    new("CABIN ASSY","cabinAssy"),            new("BODY ASSY","bodyAssy"),
+                    new("STEERING SYSTEM","steeringSystem"),  new("BRAKE SYSTEM","brakeSystem"),
+                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
+                    new("FUEL SYSTEM","fuelSystem"),          new("TYRE CONDITION","tyreCondition"),
+                }),
+                new("EXTERIOR", new FieldDef[] {
+                    new("BONNET ASSY","bonnet"), new("BUMPERS","bumpers"),
+                    new("DOORS","doors"), new("ALL GLASSES","allGlasses"), new("SIDE FENDERS","sideFenders"),
+                }),
+                new("INTERIOR", new FieldDef[] {
+                    new("DASH BOARD","dashboard"), new("SEATS & MATS","seats"),
+                    new("UPHOLSTERY","upholstery"), new("INTERIOR TRIMS","interiorTrims"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
+                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
+                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
+                }),
+                new("COOLING SYSTEM", new FieldDef[] {
+                    new("RADIATOR","radiator"), new("INTER COOLER","intercooler"),
+                    new("ALL HOSE PIPES","allHosePipes"),
+                }),
+                new("TRANSMISSION SYSTEM", new FieldDef[] {
+                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
+                    new("DRIVE SHAFTS","driveShafts"),
+                }),
+                new("STEERING SYSTEM", new FieldDef[] {
+                    new("STEERING WHEEL","steeringWheel"), new("STEERING COLUMN","steeringColumn"),
+                    new("STEERING BOX","steeringBox"),
+                }),
+                new("SUSPENSION SYSTEM", new FieldDef[] {
+                    new("FRONT SUSPENSION","frontSuspension"), new("REAR SUSPENSION","rearSuspension"),
+                    new("FRONT & REAR AXLES","axles"),
+                }),
+                new("OTHER SYSTEMS", new FieldDef[] {
+                    new("AIR CONDITIONER","airConditioner"), new("AUDIO","audio"),
+                    new("AIR BAGS","airBags"),               new("FRONT CRASH GUARD","frontCrashGuard"),
+                    new("REAR CRASH GUARD","rearCrashGuard"), new("SUN ROOF","sunRoof"),
+                    new("PAINT WORK","paintWork"),
+                }),
+            },
+            ["2w"] = new SectionDef[]
+            {
+                new("BASIC SYSTEMS", new FieldDef[] {
+                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
+                    new("BODY CONDITION","bodyCondition"),     new("STEERING SYSTEM","steeringSystem"),
+                    new("BRAKE SYSTEM","brakeSystem"),         new("ELECTRICAL SYSTEM","electricalSystem"),
+                    new("SUSPENSION SYSTEM","suspensionSystem"),new("FUEL SYSTEM","fuelSystem"),
+                    new("TYRE CONDITION","tyreCondition"),
+                }),
+                new("EXTERIOR", new FieldDef[] {
+                    new("FUEL TANK ASSY","fuelTankCondition"), new("FRONT SCOOP","frontScoop"),
+                    new("SEAT","seatCondition"),               new("R/V MIRRORS","rvMirrors"),
+                    new("LOCK SET","lockSet"),
+                }),
+                new("BODY", new FieldDef[] {
+                    new("MUD GUARD - FRONT","frontMudGuard"), new("MUD GUARD - REAR","rearMudGuard"),
+                    new("SIDE COVERS","sideCovers"),          new("BELLY / FLOOR PANELS","bellyPanels"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
+                    new("BRAKE LEVERS / FLUID","brakeLeversFluid"), new("ABS","abs"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
+                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
+                }),
+                new("COOLING SYSTEM", new FieldDef[] {
+                    new("RADIATOR","radiator"), new("SILENCER","silencer"),
+                    new("SILENCER COVER","silencerCover"),
+                }),
+                new("TRANSMISSION SYSTEM", new FieldDef[] {
+                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
+                    new("ACCELERATOR","accelerator"),
+                }),
+                new("STEERING SYSTEM", new FieldDef[] {
+                    new("HANDLE BAR","handleBar"), new("STEERING STEM","steeringStem"),
+                    new("FRONT FORK","frontForkAssy"),
+                }),
+                new("SUSPENSION SYSTEM", new FieldDef[] {
+                    new("FRONT SHOCK ABSORBER","frontShockAbsorber"), new("REAR SHOCK ABSORBER","rearShockAbsorber"),
+                    new("ALLOY / WHEEL RIM","alloyWheelRim"),
+                }),
+                new("OTHER SYSTEMS", new FieldDef[] {
+                    new("MAIN STAND","mainStand"), new("SIDE STAND","sideStand"),
+                    new("LEG GUARD","legGuard"),   new("SAREE GUARD","sareeGuard"),
+                    new("HORN","horn"),             new("KICK PEDAL / FOOT REST","kickPedalFootRest"),
+                    new("CHAIN GUARD","chainGuard"), new("SELF START","selfStart"),
+                }),
+            },
+            ["3w"] = new SectionDef[]
+            {
+                new("BASIC SYSTEMS", new FieldDef[] {
+                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
+                    new("CABIN ASSY","cabinAssy"),            new("LOAD BODY ASSY","loadBodyAssy"),
+                    new("STEERING SYSTEM","steeringSystem"),  new("BRAKE SYSTEM","brakeSystem"),
+                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
+                    new("FUEL SYSTEM","fuelSystem"),          new("TYRE CONDITION","tyreCondition"),
+                }),
+                new("CABIN ASSEMBLY", new FieldDef[] {
+                    new("FRONT PANEL","frontPanel"), new("FR GLASS FRAME","frontGlassFrame"),
+                    new("DASH BOARD","dashboard"),   new("SEATS & MATS","seats"),
+                    new("MUDGUARDS","mudguards"),
+                }),
+                new("LOAD BODY", new FieldDef[] {
+                    new("RIGHT SIDE GATE","rightSideGate"), new("LEFT SIDE GATE","leftSideGate"),
+                    new("TAIL GATE","tailGate"),            new("LOAD FLOOR","loadFloor"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
+                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("LIGHTS","headLights"), new("BATTERY","batteryCondition"),
+                    new("WIRING ASSY","wiringAssy"), new("SWITCHES","switches"),
+                }),
+                new("COOLING SYSTEM", new FieldDef[] {
+                    new("RADIATOR","radiator"), new("INTER COOLER","intercooler"),
+                    new("ALL HOSE PIPES","allHosePipes"),
+                }),
+                new("TRANSMISSION SYSTEM", new FieldDef[] {
+                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
+                    new("DIFFERENTIAL ASSY","differentialAssy"),
+                }),
+                new("STEERING SYSTEM", new FieldDef[] {
+                    new("STEERING HANDLE","steeringHandle"), new("STEERING COLUMN","steeringColumn"),
+                    new("STEERING LINKAGES","steeringLinkages"),
+                }),
+                new("SUSPENSION SYSTEM", new FieldDef[] {
+                    new("FRONT SUSPENSION","frontSuspension"), new("REAR SUSPENSION","rearSuspension"),
+                    new("FRONT & REAR AXLES","axles"),
+                }),
+                new("OTHER SYSTEMS", new FieldDef[] {
+                    new("AIR CONDITIONER","airConditioner"), new("AUDIO","audio"),
+                    new("UPHOLSTERY","upholstery"),          new("LOAD CARRIER","loadCarrier"),
+                    new("FRONT CRASH GUARD","frontCrashGuard"), new("REAR CRASH GUARD","rearCrashGuard"),
+                    new("SIDE MIRRORS","sideMirrors"),       new("PAINT WORK","paintWork"),
+                }),
+            },
+            ["ce"] = new SectionDef[]
+            {
+                new("BASIC SYSTEMS", new FieldDef[] {
+                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS / FRAME CONDITION","chassisCondition"),
+                    new("CABIN ASSY","cabinAssy"),             new("HYDRAULIC SYSTEM","hydraulicSystem"),
+                    new("STEERING / CONTROL SYSTEM","steeringControlSystem"), new("BRAKE SYSTEM","brakeSystem"),
+                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
+                    new("FUEL SYSTEM","fuelSystem"),           new("TYRE / TRACK CONDITION","tyreCondition"),
+                }),
+                new("CABIN ASSY", new FieldDef[] {
+                    new("CABIN STRUCTURE","cabinStructure"), new("DASHBOARD & CONTROLS","dashboardControls"),
+                    new("DOORS","doors"),                    new("GLASS PANELS","glassPanels"),
+                    new("SEAT","seats"),
+                }),
+                new("ATTACHMENTS", new FieldDef[] {
+                    new("BOOM / ARM","boomArm"),          new("BUCKET / BLADE","bucketBlade"),
+                    new("COUNTER WEIGHT","counterWeight"), new("PINS & BUSHES","pinsAndBushes"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("SERVICE BRAKE","serviceBrake"), new("RETARDER","retarder"),
+                    new("PARKING BRAKE","parkingBrake"), new("EMERGENCY STOP","emergencyStop"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("LIGHTS","headLights"), new("BATTERY","batteryCondition"),
+                    new("WIRING ASSY","wiringAssy"), new("SENSORS","sensors"),
+                }),
+                new("COOLING SYSTEM", new FieldDef[] {
+                    new("RADIATOR","radiator"), new("HYDRAULIC OIL COOLER","hydraulicOilCooler"),
+                    new("ALL HOSE PIPES","allHosePipes"),
+                }),
+                new("TRANSMISSION SYSTEM", new FieldDef[] {
+                    new("GEARBOX ASSY","gearBoxAssy"), new("TORQUE CONVERTER","torqueConverter"),
+                    new("FINAL DRIVE","finalDrive"),
+                }),
+                new("STEERING SYSTEM", new FieldDef[] {
+                    new("STEERING / CONTROL LEVERS","steeringControlLevers"),
+                    new("HYDRAULIC STEERING PUMP","hydraulicSteeringPump"),
+                    new("SWIVEL JOINTS","swivelJoints"),
+                }),
+                new("HYDRAULIC SYSTEM", new FieldDef[] {
+                    new("HYDRAULIC PUMP","hydraulicPump"), new("CYLINDERS","hydraulicCylinders"),
+                    new("HOSES & FITTINGS","hosesAndFittings"),
+                }),
+                new("OTHER SYSTEMS", new FieldDef[] {
+                    new("SWING MECHANISM","swingMechanism"), new("TRACK CHAINS","trackChains"),
+                    new("SPROCKETS","sprockets"),            new("ROLLERS","rollers"),
+                    new("HOUR METER","hourMeter"),           new("BONNET / GUARD","bonnetGuard"),
+                    new("ROCK BREAKER","rockBreaker"),       new("PAINT WORK","paintWork"),
+                }),
+            },
+            ["bus"] = new SectionDef[]
+            {
+                new("BASIC SYSTEMS", new FieldDef[] {
+                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
+                    new("COACH CONDITION","coachCondition"),   new("BODY STRUCTURE","bodyStructure"),
+                    new("STEERING SYSTEM","steeringSystem"),   new("BRAKE SYSTEM","brakeSystem"),
+                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
+                    new("FUEL SYSTEM","fuelSystem"),           new("TYRE CONDITION","tyreCondition"),
+                }),
+                new("COACH ASSEMBLY", new FieldDef[] {
+                    new("DRIVER CABIN","driverCabin"), new("DASHBOARD","dashboard"),
+                    new("DOORS","doors"),               new("ALL GLASSES","allGlasses"),
+                    new("BUMPERS & GRILLES","bumpersAndGrilles"),
+                }),
+                new("BODY ASSY", new FieldDef[] {
+                    new("SEATS & BERTHS","seatsAndBerths"), new("INTERIOR TRIMS","interiorTrims"),
+                    new("SIDE BODY PANELS","sideBodyPanels"), new("REAR BODY PANELS","rearBodyPanels"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
+                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
+                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
+                }),
+                new("COOLING SYSTEM", new FieldDef[] {
+                    new("RADIATOR","radiator"), new("INTER COOLER","intercooler"),
+                    new("ALL HOSE PIPES","allHosePipes"),
+                }),
+                new("TRANSMISSION SYSTEM", new FieldDef[] {
+                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
+                    new("DIFFERENTIAL ASSY","differentialAssy"),
+                }),
+                new("STEERING SYSTEM", new FieldDef[] {
+                    new("STEERING WHEEL","steeringWheel"), new("STEERING COLUMN","steeringColumn"),
+                    new("STEERING BOX","steeringBox"),
+                }),
+                new("SUSPENSION SYSTEM", new FieldDef[] {
+                    new("FRONT SUSPENSION","frontSuspension"), new("REAR SUSPENSION","rearSuspension"),
+                    new("FRONT & REAR AXLES","axles"),
+                }),
+                new("OTHER SYSTEMS", new FieldDef[] {
+                    new("AIR CONDITIONER","airConditioner"), new("AUDIO","audio"),
+                    new("UPHOLSTERY","upholstery"),          new("LOAD CARRIER","loadCarrier"),
+                    new("FRONT CRASH GUARD","frontCrashGuard"), new("REAR CRASH GUARD","rearCrashGuard"),
+                    new("SIDE MIRRORS","sideMirrors"),       new("PAINT WORK","paintWork"),
+                }),
+            },
+            ["fe"] = new SectionDef[]
+            {
+                new("BASIC SYSTEMS", new FieldDef[] {
+                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
+                    new("OPERATOR PLATFORM","operatorPlatform"),new("BODY ASSY","bodyAssy"),
+                    new("STEERING SYSTEM","steeringSystem"),   new("BRAKE SYSTEM","brakeSystem"),
+                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
+                    new("FUEL SYSTEM","fuelSystem"),           new("TYRE CONDITION","tyreCondition"),
+                }),
+                new("CABIN ASSEMBLY", new FieldDef[] {
+                    new("OPERATOR STATION","operatorStation"), new("DASH BOARD","dashboard"),
+                    new("CANOPY","canopy"),                    new("LOCK SET","lockSet"),
+                    new("SEAT","seats"),
+                }),
+                new("BODY ASSY", new FieldDef[] {
+                    new("BONNET","bonnet"), new("FRONT GRILLES","frontGrilles"),
+                    new("SIDE FENDERS","sideFenders"), new("FUEL TANK","fuelTankFe"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("RIGHT INDIVIDUAL BRAKES","rightIndividualBrakes"),
+                    new("LEFT INDIVIDUAL BRAKES","leftIndividualBrakes"),
+                    new("PARKING BRAKE","parkingBrake"),
+                    new("BRAKE EQUALIZATION","brakeEqualization"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
+                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
+                }),
+                new("COOLING SYSTEM", new FieldDef[] {
+                    new("RADIATOR","radiator"), new("FAN ASSY","fanAssy"),
+                    new("ALL HOSE PIPES","allHosePipes"),
+                }),
+                new("TRANSMISSION SYSTEM", new FieldDef[] {
+                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
+                    new("DIFFERENTIAL ASSY","differentialAssy"),
+                }),
+                new("STEERING SYSTEM", new FieldDef[] {
+                    new("STEERING WHEEL","steeringWheel"), new("STEERING COLUMN","steeringColumn"),
+                    new("STEERING BOX","steeringBox"),
+                }),
+                new("SUSPENSION SYSTEM", new FieldDef[] {
+                    new("FRONT AXLE","frontAxleFe"), new("REAR AXLE","rearAxleFe"),
+                    new("TIE RODS & JOINTS","tieRodsJoints"),
+                }),
+                new("OTHER SYSTEMS", new FieldDef[] {
+                    new("MUFFLER","muffler"),              new("AIR FILTER","airFilter"),
+                    new("ATTACHMENT HITCH","attachmentHitch"), new("HYDRAULIC LIFT ARM","hydraulicLiftFe"),
+                    new("FRONT CRASH GUARD","frontCrashGuard"), new("DROP ARM","dropArm"),
+                    new("REAR DRAWBAR","rearDrawbar"),     new("PAINT WORK","paintWork"),
+                }),
+            },
+        };
+
+        private static string? GetInsValue(InspectionDetails ins, string camelKey)
+        {
+            var pascal = char.ToUpperInvariant(camelKey[0]) + camelKey.Substring(1);
+            return typeof(InspectionDetails).GetProperty(pascal, BindingFlags.Public | BindingFlags.Instance)?.GetValue(ins)?.ToString();
+        }
+
+        private static string NormVehicleTypeKey(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return "cv";
+            var s = raw.Trim().ToLowerInvariant();
+            if (s.Contains("commercial") || s == "cv")   return "cv";
+            if (s.Contains("four")       || s == "4w")   return "4w";
+            if (s.Contains("two")        || s == "2w")   return "2w";
+            if (s.Contains("three")      || s == "3w")   return "3w";
+            if (s.Contains("construction") || s == "ce") return "ce";
+            if (s.Contains("bus")        || s == "bus")  return "bus";
+            if (s.Contains("tractor") || s.Contains("farm") || s == "fe") return "fe";
+            return "cv";
+        }
+
+        private static string GetSectionIcon(string name) => name switch
+        {
+            "BASIC SYSTEMS"                             => SVGIcons.Basic,
+            "BRAKES"                                    => SVGIcons.Brakes,
+            "ELECTRICAL SYSTEM"                         => SVGIcons.Electrical,
+            "COOLING SYSTEM"                            => SVGIcons.Cooling,
+            "TRANSMISSION SYSTEM"                       => SVGIcons.Transmission,
+            "STEERING SYSTEM"                           => SVGIcons.Steering,
+            "SUSPENSION SYSTEM"                         => SVGIcons.Suspension,
+            "CABIN ASSEMBLY" or "CABIN ASSY" or "COACH ASSEMBLY" => SVGIcons.Cabin,
+            "LOAD BODY" or "BODY ASSY" or "EXTERIOR" or "INTERIOR" => SVGIcons.LoadBody,
+            "ATTACHMENTS" or "HYDRAULIC SYSTEM"         => SVGIcons.Cooling,
+            _                                           => SVGIcons.Other,
+        };
+
         private void ComposeSystemScoresPage(ColumnDescriptor main, ValuationDocument doc)
         {
             var ins = doc.InspectionDetails;
@@ -922,75 +1428,42 @@ namespace Valuation.Api.Services
                 return;
             }
 
+            var vk = NormVehicleTypeKey(doc.Stakeholder?.ValuationType);
+            if (!PdfFieldRegistry.TryGetValue(vk, out var allSections) || allSections.Length == 0)
+                allSections = PdfFieldRegistry["cv"];
+
+            // Last section is OTHER SYSTEMS — rendered full-width at bottom in 2 columns
+            var mainSections = allSections.Take(allSections.Length - 1).ToArray();
+            var otherSection = allSections.Last();
+
+            // 4 sections on the left, rest on the right — balances heavy BASIC SYSTEMS against lighter right-side sections
+            int mid = Math.Min(4, mainSections.Length);
+            var leftSections  = mainSections.Take(mid).ToArray();
+            var rightSections = mainSections.Skip(mid).ToArray();
+
+            Dictionary<string, string?> BuildItems(SectionDef sec) =>
+                sec.Fields.ToDictionary(f => f.Label, f => GetInsValue(ins, f.Key));
+
             main.Item().Row(row =>
             {
                 row.RelativeItem().Column(col =>
                 {
-                    col.Item().Element(c => DrawSystemCard(c, SVGIcons.Basic, "BASIC SYSTEMS", new()
-                    {
-                        { "ENGINE CONDITION",  ins.EngineCondition },   { "CHASSIS CONDITION", ins.ChassisCondition },
-                        { "CABIN ASSY",        ins.Cabin },             { "STEERING SYSTEM",   ins.SteeringAssy },
-                        { "BRAKE SYSTEM",      ins.BrakeSystem },       { "ELECTRICAL SYSTEM", ins.ElectricAssembly },
-                        { "SUSPENSION SYSTEM", ins.SuspensionSystem },  { "FUEL SYSTEM",       doc.VehicleDetails?.Fuel },
-                        { "TYRE CONDITION",    ins.OverallTyreCondition }
-                    }));
-                    col.Item().Element(c => DrawSystemCard(c, SVGIcons.Brakes, "BRAKES", new()
-                    {
-                        { "FRONT BRAKES","GOOD"}, { "REAR BRAKES","GOOD" },
-                        { "HAND BRAKE",  "GOOD"}, { "ABS","GOOD" }
-                    }));
-                    col.Item().Element(c => DrawSystemCard(c, SVGIcons.Steering, "STEERING SYSTEM", new()
-                    {
-                        { "STEERING WHEEL","GOOD"},   { "STEERING COLUMN","GOOD" },
-                        { "STEERING BOX",  "GOOD"},   { "STEERING LINKAGES","GOOD" }
-                    }));
-                    col.Item().Element(c => DrawSystemCard(c, SVGIcons.Cooling, "COOLING SYSTEM", new()
-                    {
-                        { "RADIATOR", ins.Radiator }, { "INTER COOLER", ins.Intercooler },
-                        { "ALL HOSE PIPES", ins.AllHosePipes }
-                    }));
+                    foreach (var sec in leftSections)
+                        col.Item().Element(c => DrawSystemCard(c, GetSectionIcon(sec.Name), sec.Name, BuildItems(sec)));
                 });
 
                 row.ConstantItem(8);
 
                 row.RelativeItem().Column(col =>
                 {
-                    col.Item().Element(c => DrawSystemCard(c, SVGIcons.Cabin, "CABIN ASSEMBLY", new()
-                    {
-                        { "CABIN",       ins.Cabin },           { "DASHBOARD", ins.Dashboard },
-                        { "DOORS",       "GOOD" },              { "ALL GLASSES", ins.WindshieldGlass },
-                        { "SEATS",       ins.Seats }
-                    }));
-                    col.Item().Element(c => DrawSystemCard(c, SVGIcons.LoadBody, "LOAD BODY", new()
-                    {
-                        { "RIGHT SIDE GATE","GOOD"}, { "LEFT SIDE GATE","GOOD" },
-                        { "TAIL GATE",      "GOOD"}, { "LOAD FLOOR","GOOD" }
-                    }));
-                    col.Item().Element(c => DrawSystemCard(c, SVGIcons.Transmission, "TRANSMISSION SYSTEM", new()
-                    {
-                        { "GEARBOX ASSY",     ins.GearBoxAssy },    { "CLUTCH SYSTEM", ins.ClutchSystem },
-                        { "DIFFERENTIAL ASSY",ins.DifferentialAssy }
-                    }));
-                    col.Item().Element(c => DrawSystemCard(c, SVGIcons.Electrical, "ELECTRICAL SYSTEM", new()
-                    {
-                        { "LIGHTS", ins.HeadLamps }, { "BATTERY", ins.BatteryCondition },
-                        { "WIRING ASSY", ins.ElectricAssembly }
-                    }));
-                    col.Item().Element(c => DrawSystemCard(c, SVGIcons.Suspension, "SUSPENSION SYSTEM", new()
-                    {
-                        { "FRONT SUSPENSION","GOOD"}, { "REAR SUSPENSION","GOOD" },
-                        { "FRONT & REAR AXLES","GOOD" }
-                    }));
+                    foreach (var sec in rightSections)
+                        col.Item().Element(c => DrawSystemCard(c, GetSectionIcon(sec.Name), sec.Name, BuildItems(sec)));
                 });
             });
 
-            main.Item().Element(c => DrawSystemCard(c, SVGIcons.Other, "OTHER SYSTEMS", new()
-            {
-                { "AIR CONDITIONER","NO" },          { "FRONT CRASH GUARD","NO" },
-                { "AUDIO","NO" },                    { "REAR UNDER RUN PROTECTION","NO" },
-                { "UPHOLSTERY","GOOD" },             { "SIDE UNDER RUN PROTECTION","NO" },
-                { "LOAD CARRIER","YES" },            { "SUN ROOF","NO" }
-            }, twoColumns: true));
+            // OTHER SYSTEMS spans full width with fields in 2 columns
+            main.Item().Element(c => DrawSystemCard(c, SVGIcons.Other, otherSection.Name,
+                BuildItems(otherSection), twoColumns: true));
         }
 
         private void DrawSystemCard(IContainer container, string iconSvg, string title,
@@ -1009,12 +1482,12 @@ namespace Valuation.Api.Services
                     </svg>";
                 });
 
-                layers.PrimaryLayer().Padding(8).Column(col => 
+                layers.PrimaryLayer().Padding(7).Column(col =>
                 {
                     col.Item().PaddingBottom(4).BorderBottom(1).BorderColor("#E2E8F0").Row(row =>
                     {
                         row.AutoItem().Width(12).Height(12).Svg(_ => iconSvg);
-                        row.ConstantItem(6);
+                        row.ConstantItem(5);
                         row.RelativeItem().AlignMiddle()
                             .Text(title).FontColor(ValueDark).SemiBold().FontSize(8f);
 
@@ -1030,7 +1503,7 @@ namespace Valuation.Api.Services
                         });
                     });
 
-                    col.Item().PaddingTop(4).Table(table =>
+                    col.Item().PaddingTop(3).Table(table =>
                     {
                         table.ColumnsDefinition(cd =>
                         {
@@ -1045,14 +1518,14 @@ namespace Valuation.Api.Services
                             var verdict = MapVerdict(item.Value);
 
                             string pillBg, pillFg;
-                            if (verdict is "GOOD" or "YES")              { pillBg = "#ECFDF5"; pillFg = "#059669"; } 
-                            else if (verdict == "AVERAGE")               { pillBg = "#FFF7ED"; pillFg = "#D97706"; } 
-                            else if (verdict is "POOR" or "BAD" or "NO") { pillBg = "#FEF2F2"; pillFg = "#DC2626"; } 
-                            else                                         { pillBg = "#F1F5F9"; pillFg = "#64748B"; } 
+                            if (verdict is "GOOD" or "YES")              { pillBg = "#ECFDF5"; pillFg = "#059669"; }
+                            else if (verdict == "AVERAGE")               { pillBg = "#FFF7ED"; pillFg = "#D97706"; }
+                            else if (verdict is "POOR" or "BAD" or "NO") { pillBg = "#FEF2F2"; pillFg = "#DC2626"; }
+                            else                                         { pillBg = "#F1F5F9"; pillFg = "#64748B"; }
 
                             void BuildCell(IContainer c)
                             {
-                                c.PaddingVertical(3f).Row(r =>
+                                c.PaddingVertical(2.5f).Row(r =>
                                 {
                                     r.RelativeItem().AlignMiddle()
                                         .Text(item.Key).FontSize(7f).FontColor(LabelSlate);
@@ -1104,107 +1577,63 @@ namespace Valuation.Api.Services
             return spaced.ToUpper();
         }
 
-        private void ComposePhotoGalleryAndDisclaimer(ColumnDescriptor main, ValuationDocument doc, Dictionary<string, byte[]> photos)
+        private void RenderPhotoTable(IContainer into, (string Label, string[] Keys)[] slots,
+            ValuationDocument doc, Dictionary<string, byte[]> photos)
         {
-            var orderedSlots = new[] {
-                ("FRONT VIEW",     new[] { "FrontView", "FrontViewGrille" }),
-                ("REAR VIEW",      new[] { "RearView" }),
-                ("FRONT RIGHT",    new[] { "FrontRightSide", "FrontRight" }),
-                ("FRONT LEFT",     new[] { "FrontLeftSide",  "FrontLeft"  }),
-                ("REAR RIGHT",     new[] { "RearRightSide",  "RearRight"  }),
-                ("REAR LEFT",      new[] { "RearLeftSide",   "RearLeft"   }),
-                ("RIGHT SIDE",     new[] { "RightSideView",  "DriverSideProfile" }),
-                ("LEFT SIDE",      new[] { "LeftSideView",   "PassengerSideProfile" }),
-                ("ODO METER",      new[] { "OdoMeter",       "Dashboard", "InstrumentCluster" }),
-                ("ENGINE BAY",     new[] { "EngineBay",      "Engine" }),
-                ("VIN PLATE",      new[] { "VinPlate",       "VIN" }),
-                ("CHASSIS NUMBER", new[] { "ChassisNumber",  "ChassisNumberPlate", "Chassis" }),
-                ("INTERIOR FRONT", new[] { "InteriorFront",  "FrontInterior" }),
-                ("INTERIOR REAR",  new[] { "InteriorRear",   "RearInterior" })
-            };
-
-            var usedKeys = new HashSet<string>();
-
-            main.Item().Section("PhotoGalleryTarget").Table(table =>
+            into.Table(table =>
             {
                 table.ColumnsDefinition(cd => { cd.RelativeColumn(); cd.ConstantColumn(12); cd.RelativeColumn(); });
-                int cIdx = 0;
-                foreach (var slot in orderedSlots)
+                int col = 0;
+                foreach (var slot in slots)
                 {
-                    byte[]? ph  = null;
-                    string? url = null;
-                    foreach (var key in slot.Item2)
+                    byte[]? ph = null; string? url = null;
+                    foreach (var key in slot.Keys)
                     {
-                        if (photos.TryGetValue(key, out var val))
-                        {
-                            ph = val; usedKeys.Add(key);
-                            doc.PhotoUrls?.TryGetValue(key, out url);
-                            break;
-                        }
+                        if (photos.TryGetValue(key, out var val)) { ph = val; doc.PhotoUrls?.TryGetValue(key, out url); break; }
                     }
-                    if (ph != null)
-                    {
-                        table.Cell().Element(c => DrawPhotoCard(c, ph, slot.Item1, url));
-                        cIdx++;
-                        if (cIdx % 2 != 0) table.Cell();
-                    }
+                    if (ph == null) continue;
+                    var p = ph; var l = slot.Label; var u = url;
+                    table.Cell().Element(c => DrawPhotoCard(c, p, l, u));
+                    col++;
+                    if (col % 2 != 0) table.Cell();
                 }
-
-                var unmapped = photos
-                    .Where(p => !usedKeys.Contains(p.Key)
-                             && !p.Key.Contains("Tyre", StringComparison.OrdinalIgnoreCase)
-                             && !p.Key.Contains("Tire", StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-                foreach (var kvp in unmapped)
-                {
-                    string? url = null;
-                    doc.PhotoUrls?.TryGetValue(kvp.Key, out url);
-                    table.Cell().Element(c => DrawPhotoCard(c, kvp.Value, FormatPhotoLabel(kvp.Key), url));
-                    usedKeys.Add(kvp.Key); cIdx++;
-                    if (cIdx % 2 != 0) table.Cell();
-                }
-                if (cIdx % 2 != 0) table.Cell();
+                if (col % 2 != 0) table.Cell();
             });
+        }
 
-            var tyrePhotos = photos
-                .Where(p => p.Key.Contains("Tyre", StringComparison.OrdinalIgnoreCase)
-                         || p.Key.Contains("Tire", StringComparison.OrdinalIgnoreCase))
-                .Take(4).ToList();
-            if (tyrePhotos.Any())
-            {
-                main.Item().PaddingTop(5).Table(table =>
-                {
-                    table.ColumnsDefinition(cd =>
-                    {
-                        cd.RelativeColumn(); cd.ConstantColumn(10); cd.RelativeColumn();
-                        cd.ConstantColumn(10); cd.RelativeColumn(); cd.ConstantColumn(10); cd.RelativeColumn();
-                    });
-                    for (int i = 0; i < tyrePhotos.Count; i++)
-                    {
-                        var photo = tyrePhotos[i];
-                        string? url = null;
-                        doc.PhotoUrls?.TryGetValue(photo.Key, out url);
-                        var cell = table.Cell().AspectRatio(4 / 3f);
-                        if (!string.IsNullOrWhiteSpace(url)) cell = cell.Hyperlink(url);
-                        cell.Layers(layers =>
-                        {
-                            layers.PrimaryLayer().AlignCenter().AlignMiddle().Image(photo.Value).FitArea();
-                            layers.Layer().Svg(s =>
-                            {
-                                string wStr = s.Width.ToString("F1", CultureInfo.InvariantCulture);
-                                string hStr = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                                string w16  = (s.Width  - 16).ToString("F1", CultureInfo.InvariantCulture);
-                                string h16  = (s.Height - 16).ToString("F1", CultureInfo.InvariantCulture);
-                                return $@"<svg width=""{wStr}"" height=""{hStr}"" viewBox=""0 0 {wStr} {hStr}"">
-                                    <path fill-rule=""evenodd"" d=""M0,0 h{wStr} v{hStr} h-{wStr} Z M8,0 a8,8 0 0 0 -8,8 v{h16} a8,8 0 0 0 8,8 h{w16} a8,8 0 0 0 8,-8 v-{h16} a8,8 0 0 0 -8,-8 Z"" fill=""#FFFFFF""/>
-                                </svg>";
-                            });
-                        });
-                        if (i < 3) table.Cell();
-                    }
-                });
-            }
+        private void ComposePhotoGalleryAndDisclaimer(ColumnDescriptor main, ValuationDocument doc, Dictionary<string, byte[]> photos)
+        {
+            // Page 4: exterior views
+            RenderPhotoTable(main.Item().PaddingTop(4).Section("PhotoGalleryTarget"), new (string Label, string[] Keys)[] {
+                ("FRONT VIEW",  new[] { "FrontViewGrille", "FrontView" }),
+                ("REAR VIEW",   new[] { "RearViewTailgate", "RearView" }),
+                ("FRONT RIGHT", new[] { "FrontRightSide", "FrontRight" }),
+                ("FRONT LEFT",  new[] { "FrontLeftSide",  "FrontLeft" }),
+                ("REAR RIGHT",  new[] { "RearRightSide",  "RearRight" }),
+                ("REAR LEFT",   new[] { "RearLeftSide",   "RearLeft"  }),
+            }, doc, photos);
 
+            main.Item().PageBreak();
+
+            // Page 5: interior / detail views
+            RenderPhotoTable(main.Item().PaddingTop(4), new (string Label, string[] Keys)[] {
+                ("RIGHT SIDE",  new[] { "DriverSideProfile",    "RightSideView"      }),
+                ("LEFT SIDE",   new[] { "PassengerSideProfile", "LeftSideView"       }),
+                ("ODO METER",   new[] { "Odometer", "OdoMeter", "InstrumentCluster" }),
+                ("ENGINE BAY",  new[] { "EngineBay", "Engine"                        }),
+                ("DASHBOARD",   new[] { "Dashboard", "DashboardCloseup"             }),
+                ("SELFIE",      new[] { "SelfieWithVehicle", "Selfie"               }),
+            }, doc, photos);
+
+            main.Item().PageBreak();
+
+            // Page 6: chassis identification photos
+            RenderPhotoTable(main.Item().PaddingTop(4), new (string Label, string[] Keys)[] {
+                ("CHASSIS NUMBER", new[] { "ChassisNumberPlate", "ChassisNumber", "Chassis" }),
+                ("VIN PLATE",      new[] { "VinPlate", "VIN", "ChassisImprint"             }),
+            }, doc, photos);
+
+            // Disclaimer
             main.Item().PaddingTop(20).Layers(layers =>
             {
                 layers.Layer().Svg(size => {

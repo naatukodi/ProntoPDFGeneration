@@ -50,6 +50,7 @@ public class Stakeholder
     public Applicant? Applicant { get; set; }
     public string? VehicleNumber { get; set; }
     public string? VehicleSegment { get; set; }
+    public string? ValuationType { get; set; }
     public List<Document>? Documents { get; set; }
 }
 

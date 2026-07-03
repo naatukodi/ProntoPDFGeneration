@@ -6,6 +6,19 @@ var builder = WebApplication.CreateBuilder(args);
 // --- SET QUESTPDF LICENSE HERE ---
 QuestPDF.Settings.License = QuestPDF.Infrastructure.LicenseType.Community;
 
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFrontend", policy =>
+    {
+        policy.WithOrigins(
+                "https://prontofirebase.web.app",
+                "https://prontofirebase.firebaseapp.com",
+                "http://localhost:4200")
+              .AllowAnyHeader()
+              .AllowAnyMethod();
+    });
+});
+
 // Enable detailed layout diagnostics
 QuestPDF.Settings.EnableDebugging = true;
 
@@ -47,6 +60,7 @@ app.UseSwaggerUI(c =>
     c.RoutePrefix = string.Empty;
 });
 
+app.UseCors("AllowFrontend");
 app.UseAuthorization();
 app.MapControllers();
 app.Run();
