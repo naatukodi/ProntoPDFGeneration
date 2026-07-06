@@ -37,7 +37,10 @@ namespace Valuation.Api.Services
         private static readonly string ValueDark  = "#1a1a1a";
         private static readonly string MintBg     = "#F0FDF4";
         private static readonly string MintText   = "#059669";
-        private static readonly TimeSpan PhotoDownloadTimeout = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan PhotoDownloadTimeout = TimeSpan.FromSeconds(45);
+        // Limit concurrent downloads so photos don't starve each other on slow links
+        private static readonly SemaphoreSlim PhotoDownloadGate = new(4);
+        private static readonly string[] VideoExtensions = { ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg" };
 
         private Container Container => _cosmos.GetDatabase(_dbId).GetContainer(_containerId);
         private PartitionKey GetPk(string vehicleNumber, string applicantContact) =>
@@ -242,28 +245,48 @@ namespace Valuation.Api.Services
             return 8.0;
         }
 
+        private static bool IsVideoEntry(string key, string url)
+        {
+            if (key.Contains("video", StringComparison.OrdinalIgnoreCase)) return true;
+            var path = url.Split('?')[0];
+            return VideoExtensions.Any(ext => path.EndsWith(ext, StringComparison.OrdinalIgnoreCase));
+        }
+
         private async Task<Dictionary<string, byte[]>> DownloadPhotosAsync(Dictionary<string, string>? photoUrls)
         {
             var result = new Dictionary<string, byte[]>();
             if (photoUrls == null || !photoUrls.Any()) return result;
 
             var tasks = photoUrls
-                .Where(kvp => !string.IsNullOrEmpty(kvp.Value))
+                .Where(kvp => !string.IsNullOrEmpty(kvp.Value) && !IsVideoEntry(kvp.Key, kvp.Value))
                 .Select(async kvp =>
                 {
+                    await PhotoDownloadGate.WaitAsync();
                     try
                     {
-                        using var cts = new CancellationTokenSource(PhotoDownloadTimeout);
-                        var resp      = await _httpClient.GetAsync(kvp.Value, cts.Token);
-                        if (resp.IsSuccessStatusCode)
+                        // One retry: transient blob/network hiccups shouldn't drop report photos
+                        for (var attempt = 0; attempt < 2; attempt++)
                         {
-                            var bytes = await resp.Content.ReadAsByteArrayAsync();
-                            return (Key: kvp.Key, Bytes: bytes, Ok: true);
+                            try
+                            {
+                                using var cts = new CancellationTokenSource(PhotoDownloadTimeout);
+                                var resp      = await _httpClient.GetAsync(kvp.Value, cts.Token);
+                                if (resp.IsSuccessStatusCode)
+                                {
+                                    var bytes = await resp.Content.ReadAsByteArrayAsync();
+                                    if (bytes.Length > 0)
+                                        return (Key: kvp.Key, Bytes: bytes, Ok: true);
+                                }
+                            }
+                            catch (OperationCanceledException) { }
+                            catch (Exception) { }
                         }
+                        return (Key: kvp.Key, Bytes: Array.Empty<byte>(), Ok: false);
                     }
-                    catch (OperationCanceledException) { }
-                    catch (Exception) { }
-                    return (Key: kvp.Key, Bytes: Array.Empty<byte>(), Ok: false);
+                    finally
+                    {
+                        PhotoDownloadGate.Release();
+                    }
                 });
 
             foreach (var r in (await Task.WhenAll(tasks)).Where(r => r.Ok && r.Bytes.Length > 0))
@@ -1628,10 +1651,28 @@ namespace Valuation.Api.Services
             main.Item().PageBreak();
 
             // Page 6: chassis identification photos
+            // (ChassisVerification / ChassisStencilTrace render on page 2 regulatory cards)
             RenderPhotoTable(main.Item().PaddingTop(4), new (string Label, string[] Keys)[] {
-                ("CHASSIS NUMBER", new[] { "ChassisNumberPlate", "ChassisNumber", "Chassis" }),
-                ("VIN PLATE",      new[] { "VinPlate", "VIN", "ChassisImprint"             }),
+                ("CHASSIS NUMBER", new[] { "ChassisNumberPlate", "ChassisNumber", "Chassis", "ChassisImprint" }),
+                ("VIN PLATE",      new[] { "VinPlate", "VIN" }),
             }, doc, photos);
+
+            // Tyres: all uploaded tyre photos in one unlabeled row of four
+            var tyreKeys = new[] { "TireFrontLeft", "TireFrontRight", "TireRearLeft", "TireRearRight" };
+            var tyrePhotos = tyreKeys.Where(photos.ContainsKey).Select(k => photos[k]).ToList();
+            if (tyrePhotos.Any())
+            {
+                main.Item().PaddingTop(4).Row(row =>
+                {
+                    foreach (var tyre in tyrePhotos)
+                    {
+                        var img = tyre;
+                        row.RelativeItem().Padding(3).Element(c => DrawUnlabeledPhoto(c, img));
+                    }
+                    // Keep four-column sizing when fewer than four tyres exist
+                    for (var i = tyrePhotos.Count; i < 4; i++) row.RelativeItem();
+                });
+            }
 
             // Disclaimer
             main.Item().PaddingTop(20).Layers(layers =>
@@ -1648,6 +1689,25 @@ namespace Valuation.Api.Services
                     col.Item()
                         .Text("This Valuation Report is based on a physical, visual inspection of the vehicle carried out on the date of inspection and represents our professional opinion as on that date. The inspection is non-intrusive, and hidden, latent, or intermittent defects may not be identified. We do not verify or authenticate the genuineness of vehicle documents or odometer readings and assume no responsibility thereof. As there is no standard price list for used vehicles, the valuation stated is an estimated market value derived using our standard valuation methodology and prevailing market conditions. Actual realization may vary. This report is issued solely for the use of the addressee and shall not be relied upon by any third party. The company shall not be liable for any direct, indirect, incidental, or consequential losses arising from reliance on this report. This report is issued without prejudice.")
                         .FontSize(7.5f).FontColor("#6B7280").LineHeight(1.5f);
+                });
+            });
+        }
+
+        private void DrawUnlabeledPhoto(IContainer container, byte[] image)
+        {
+            container.AspectRatio(3 / 4f).Layers(imgLayers =>
+            {
+                imgLayers.PrimaryLayer().AlignCenter().AlignMiddle().Image(image).FitArea();
+                imgLayers.Layer().Svg(s =>
+                {
+                    string wStr = s.Width.ToString("F1",  CultureInfo.InvariantCulture);
+                    string hStr = s.Height.ToString("F1", CultureInfo.InvariantCulture);
+                    string w20  = (s.Width  - 20).ToString("F1", CultureInfo.InvariantCulture);
+                    string h20  = (s.Height - 20).ToString("F1", CultureInfo.InvariantCulture);
+                    return $@"<svg width=""{wStr}"" height=""{hStr}"" viewBox=""0 0 {wStr} {hStr}"">
+                        <path fill-rule=""evenodd"" d=""M0,0 h{wStr} v{hStr} h-{wStr} Z M10,0 a10,10 0 0 0 -10,10 v{h20} a10,10 0 0 0 10,10 h{w20} a10,10 0 0 0 10,-10 v-{h20} a10,10 0 0 0 -10,-10 Z"" fill=""#FFFFFF""/>
+                        <rect x=""1"" y=""1"" width=""{(s.Width-2).ToString("F1", CultureInfo.InvariantCulture)}"" height=""{(s.Height-2).ToString("F1", CultureInfo.InvariantCulture)}"" rx=""10"" fill=""none"" stroke=""#F5F5F5"" stroke-width=""2""/>
+                    </svg>";
                 });
             });
         }
