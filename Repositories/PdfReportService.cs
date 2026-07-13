@@ -1601,7 +1601,7 @@ namespace Valuation.Api.Services
         }
 
         private void RenderPhotoTable(IContainer into, (string Label, string[] Keys)[] slots,
-            ValuationDocument doc, Dictionary<string, byte[]> photos)
+            ValuationDocument doc, Dictionary<string, byte[]> photos, HashSet<string>? selectedKeys)
         {
             into.Table(table =>
             {
@@ -1609,12 +1609,13 @@ namespace Valuation.Api.Services
                 int col = 0;
                 foreach (var slot in slots)
                 {
-                    byte[]? ph = null; string? url = null;
+                    byte[]? ph = null; string? url = null; string? matchedKey = null;
                     foreach (var key in slot.Keys)
                     {
-                        if (photos.TryGetValue(key, out var val)) { ph = val; doc.PhotoUrls?.TryGetValue(key, out url); break; }
+                        if (photos.TryGetValue(key, out var val)) { ph = val; matchedKey = key; doc.PhotoUrls?.TryGetValue(key, out url); break; }
                     }
                     if (ph == null) continue;
+                    if (selectedKeys != null && !selectedKeys.Contains(matchedKey!)) continue;
                     var p = ph; var l = slot.Label; var u = url;
                     table.Cell().Element(c => DrawPhotoCard(c, p, l, u));
                     col++;
@@ -1626,7 +1627,16 @@ namespace Valuation.Api.Services
 
         private void ComposePhotoGalleryAndDisclaimer(ColumnDescriptor main, ValuationDocument doc, Dictionary<string, byte[]> photos)
         {
-            // Page 4: exterior views
+            // QC's chosen subset of gallery photos. Null/empty (never set, or every photo unchecked)
+            // falls back to the standard behavior of including everything available.
+            var selectedKeys = doc.SelectedGalleryPhotos != null && doc.SelectedGalleryPhotos.Count > 0
+                ? new HashSet<string>(doc.SelectedGalleryPhotos)
+                : null;
+
+            // All labeled gallery photos flow through one continuous table (2 per row).
+            // QuestPDF paginates a Table's rows across pages automatically, so this
+            // naturally packs ~6 photos per page instead of forcing fixed category
+            // pages that leave mostly-empty pages when few photos are selected.
             RenderPhotoTable(main.Item().PaddingTop(4).Section("PhotoGalleryTarget"), new (string Label, string[] Keys)[] {
                 ("FRONT VIEW",  new[] { "FrontViewGrille", "FrontView" }),
                 ("REAR VIEW",   new[] { "RearViewTailgate", "RearView" }),
@@ -1634,32 +1644,25 @@ namespace Valuation.Api.Services
                 ("FRONT LEFT",  new[] { "FrontLeftSide",  "FrontLeft" }),
                 ("REAR RIGHT",  new[] { "RearRightSide",  "RearRight" }),
                 ("REAR LEFT",   new[] { "RearLeftSide",   "RearLeft"  }),
-            }, doc, photos);
-
-            main.Item().PageBreak();
-
-            // Page 5: interior / detail views
-            RenderPhotoTable(main.Item().PaddingTop(4), new (string Label, string[] Keys)[] {
                 ("RIGHT SIDE",  new[] { "DriverSideProfile",    "RightSideView"      }),
                 ("LEFT SIDE",   new[] { "PassengerSideProfile", "LeftSideView"       }),
                 ("ODO METER",   new[] { "Odometer", "OdoMeter", "InstrumentCluster" }),
                 ("ENGINE BAY",  new[] { "EngineBay", "Engine"                        }),
                 ("DASHBOARD",   new[] { "Dashboard", "DashboardCloseup"             }),
                 ("SELFIE",      new[] { "SelfieWithVehicle", "Selfie"               }),
-            }, doc, photos);
-
-            main.Item().PageBreak();
-
-            // Page 6: chassis identification photos
-            // (ChassisVerification / ChassisStencilTrace render on page 2 regulatory cards)
-            RenderPhotoTable(main.Item().PaddingTop(4), new (string Label, string[] Keys)[] {
+                // Chassis identification photos (ChassisVerification / ChassisStencilTrace
+                // render separately on page 2's regulatory cards)
                 ("CHASSIS NUMBER", new[] { "ChassisNumberPlate", "ChassisNumber", "Chassis", "ChassisImprint" }),
                 ("VIN PLATE",      new[] { "VinPlate", "VIN" }),
-            }, doc, photos);
+            }, doc, photos, selectedKeys);
 
-            // Tyres: all uploaded tyre photos in one unlabeled row of four
+            // Tyres: all uploaded (and selected, if a selection is set) tyre photos in one unlabeled row of four.
+            // Flows directly after the photo table — same page if there's room, a new page otherwise.
             var tyreKeys = new[] { "TireFrontLeft", "TireFrontRight", "TireRearLeft", "TireRearRight" };
-            var tyrePhotos = tyreKeys.Where(photos.ContainsKey).Select(k => photos[k]).ToList();
+            var tyrePhotos = tyreKeys
+                .Where(photos.ContainsKey)
+                .Where(k => selectedKeys == null || selectedKeys.Contains(k))
+                .Select(k => photos[k]).ToList();
             if (tyrePhotos.Any())
             {
                 main.Item().PaddingTop(4).Row(row =>

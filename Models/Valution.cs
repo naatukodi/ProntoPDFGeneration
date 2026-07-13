@@ -28,6 +28,11 @@ public class ValuationDocument
     public QualityControl? QualityControl { get; set; }
     public ValuationResponse? ValuationResponse { get; set; }
     public Dictionary<string, string> PhotoUrls { get; set; } = new();
+
+    // Keys (from PhotoUrls) QC chose to include in the PDF gallery page.
+    // Null/empty means "not set" — fall back to including everything available.
+    public List<string>? SelectedGalleryPhotos { get; set; }
+
     public List<WorkflowStep>? Workflow { get; set; }
     public string? Status { get; set; } = "Open";
     public string? CreatedBy { get; set; }
