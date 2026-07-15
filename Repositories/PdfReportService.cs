@@ -342,7 +342,7 @@ namespace Valuation.Api.Services
             return input.ToUpper();
         }
 
-        private double CalculateSystemScore(Dictionary<string, string?> items)
+        private double? CalculateSystemScoreOrNull(Dictionary<string, string?> items)
         {
             var scores = new List<double>();
             foreach (var item in items)
@@ -362,7 +362,34 @@ namespace Valuation.Api.Services
                         break;
                 }
             }
-            return scores.Any() ? Math.Round(scores.Average(), 1) : 8.0;
+            return scores.Any() ? Math.Round(scores.Average(), 1) : (double?)null;
+        }
+
+        private double CalculateSystemScore(Dictionary<string, string?> items)
+            => CalculateSystemScoreOrNull(items) ?? 8.0;
+
+        // Overall score = average of the same system card scores shown on page 3.
+        // Sections without any inspection data are excluded from the average.
+        private double CalculateOverallVehicleScore(ValuationDocument doc)
+        {
+            var ins = doc.InspectionDetails;
+            if (ins != null)
+            {
+                var vk = NormVehicleTypeKey(doc.Stakeholder?.ValuationType);
+                if (!PdfFieldRegistry.TryGetValue(vk, out var allSections) || allSections.Length == 0)
+                    allSections = PdfFieldRegistry["cv"];
+
+                var sectionScores = new List<double>();
+                foreach (var sec in allSections)
+                {
+                    var items = sec.Fields.ToDictionary(f => f.Label, f => GetInsValue(ins, f.Key));
+                    var s = CalculateSystemScoreOrNull(items);
+                    if (s.HasValue) sectionScores.Add(s.Value);
+                }
+                if (sectionScores.Any())
+                    return Math.Round(sectionScores.Average(), 1);
+            }
+            return ParseScoreValue(doc.QualityControl?.OverallRating);
         }
 
         private (string Score, string Color) GetScoreDisplayFromDouble(double score)
@@ -569,7 +596,7 @@ namespace Valuation.Api.Services
                                 .Text("OVERALL VEHICLE SCORE")
                                 .FontSize(8).ExtraBold().FontColor(BrandTeal).LetterSpacing(0.04f);
 
-                            var gaugeScore = ParseScoreValue(doc.QualityControl?.OverallRating);
+                            var gaugeScore = CalculateOverallVehicleScore(doc);
                             c.Item().AlignCenter().Height(82)
                                 .Svg(size => GenerateScoreGaugeSvg(size, gaugeScore));
 
@@ -723,21 +750,31 @@ namespace Valuation.Api.Services
 
                 outerRow.AutoItem().Column(linkCol =>
                 {
-                    linkCol.Item().PaddingBottom(5).Layers(layers => 
+                    // Dedupe status comes from the QC checklist ("valDedupe": pass/fail)
+                    var dedupe = doc.QualityControl?.QcChecklist?.GetValueOrDefault("valDedupe");
+                    string dedupeLabel  = dedupe == "pass" ? "VERIFIED CLEAN" : dedupe == "fail" ? "FLAGGED" : "PENDING";
+                    string dedupeBg     = dedupe == "pass" ? "#ECFDF5" : dedupe == "fail" ? "#FEF2F2" : "#F1F5F9";
+                    string dedupeStroke = dedupe == "pass" ? "#A7F3D0" : dedupe == "fail" ? "#FECACA" : "#E2E8F0";
+                    string dedupeColor  = dedupe == "pass" ? MintText  : dedupe == "fail" ? "#DC2626" : "#64748B";
+                    string dedupeIcon   = dedupe == "pass" ? @"<path d=""M8 12l3 3 5-6"" stroke-linecap=""round"" stroke-linejoin=""round""/>"
+                                        : dedupe == "fail" ? @"<path d=""M9 9l6 6M15 9l-6 6"" stroke-linecap=""round""/>"
+                                        : @"<path d=""M8 12h8"" stroke-linecap=""round""/>";
+
+                    linkCol.Item().PaddingBottom(5).Layers(layers =>
                     {
                         layers.Layer().Svg(s => {
                             string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
                             string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}"" rx=""12"" fill=""#ECFDF5"" stroke=""#A7F3D0"" stroke-width=""1""><rect width=""{w}"" height=""{h}"" rx=""12"" fill=""#ECFDF5"" stroke=""#A7F3D0"" stroke-width=""1""/></svg>";
+                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""12"" fill=""{dedupeBg}"" stroke=""{dedupeStroke}"" stroke-width=""1""/></svg>";
                         });
                         layers.PrimaryLayer().PaddingVertical(4).PaddingHorizontal(8).Row(r =>
                         {
                             r.AutoItem().AlignMiddle().Width(10).Height(10)
-                                .Svg(_ => @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#059669"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""10""/><path d=""M8 12l3 3 5-6"" stroke-linecap=""round"" stroke-linejoin=""round""/></svg>");
+                                .Svg(_ => $@"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""{dedupeColor}"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""10""/>{dedupeIcon}</svg>");
                             r.ConstantItem(4);
                             r.AutoItem().AlignMiddle().Text(t => {
                                 t.Span("DEDUPE: ").FontSize(7).ExtraBold().FontColor(ValueDark);
-                                t.Span("VERIFIED CLEAN").FontSize(7).ExtraBold().FontColor(MintText);
+                                t.Span(dedupeLabel).FontSize(7).ExtraBold().FontColor(dedupeColor);
                             });
                         });
                     });
@@ -926,18 +963,48 @@ namespace Valuation.Api.Services
             );
 
             bool hasLien = vd?.Hypothecation ?? false;
+
+            var insStat = DocumentStatus(vd?.InsurancePolicyNo, vd?.InsuranceValidUpTo);
+            var insDetails = string.IsNullOrWhiteSpace(vd?.InsurancePolicyNo)
+                ? "Policy: ---"
+                : $"Policy: {vd!.InsurancePolicyNo}" + (vd.IDV != null ? $" | IDV: Rs. {vd.IDV?.ToString("N0")}" : "");
+
+            var permitStat = DocumentStatus(vd?.PermitNo, vd?.PermitValidUpTo);
+            var permitDetails = string.IsNullOrWhiteSpace(vd?.PermitNo)
+                ? "---"
+                : string.IsNullOrWhiteSpace(vd?.PermitType) ? vd!.PermitNo! : $"{vd!.PermitType} | {vd.PermitNo}";
+
+            var fitStat = DocumentStatus(vd?.FitnessNo, vd?.FitnessValidTo);
+            var fitDetails = string.IsNullOrWhiteSpace(vd?.FitnessNo) ? "" : $"Certificate: {vd!.FitnessNo}";
+
             main.Item().Column(col =>
             {
                 AddRegulatoryCardSimple(col, "COMPREHENSIVE INSURANCE",
-                    $"Policy: #UIIC/1922/001 | IDV: Rs. {vd?.IDV?.ToString("N0") ?? "4,80,000"}", "ACTIVE", "EXP: OCT 2028");
+                    insDetails, insStat.Status, insStat.Expiry, insStat.Warn);
                 AddRegulatoryCardSimple(col, "HYPOTHECATION (STATUS)",
                     hasLien ? "LIEN DETECTED" : "CLEAN / NO LIEN DETECTED",
                     hasLien ? "LIEN" : "FREE OF LIEN", hasLien ? "" : "READY FOR TRANSFER", hasLien);
-                AddRegulatoryCardSimple(col, "NATIONAL PERMIT", "AP123456789", "ACTIVE", "EXP: OCT 2028");
-                AddRegulatoryCardSimple(col, "FITNESS CERTIFICATE", "", "---", "EXP: ---", true);
+                AddRegulatoryCardSimple(col, "NATIONAL PERMIT", permitDetails, permitStat.Status, permitStat.Expiry, permitStat.Warn);
+                AddRegulatoryCardSimple(col, "FITNESS CERTIFICATE", fitDetails, fitStat.Status, fitStat.Expiry, fitStat.Warn);
                 AddRegulatoryCardWithPhoto(col, "CHASSIS VERIFICATION",  "VERIFIED", photos, "ChassisVerification");
                 AddRegulatoryCardWithPhoto(col, "CHASSIS STENCIL TRACE", "",         photos, "ChassisStencilTrace");
             });
+        }
+
+        // Derives card status from real document data: valid date → ACTIVE/EXPIRED,
+        // number without date → ON RECORD, nothing → "---" with warning styling.
+        private static (string Status, string Expiry, bool Warn) DocumentStatus(string? docNumber, DateTime? validUpTo)
+        {
+            if (validUpTo.HasValue)
+            {
+                var exp = $"EXP: {validUpTo.Value.ToString("MMM yyyy", CultureInfo.InvariantCulture).ToUpperInvariant()}";
+                return validUpTo.Value.Date >= DateTime.UtcNow.Date
+                    ? ("ACTIVE", exp, false)
+                    : ("EXPIRED", exp, true);
+            }
+            return string.IsNullOrWhiteSpace(docNumber)
+                ? ("---", "EXP: ---", true)
+                : ("ON RECORD", "EXP: ---", false);
         }
 
         private void AddRegulatoryCardSimple(ColumnDescriptor col,
