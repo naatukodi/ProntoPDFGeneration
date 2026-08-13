@@ -7,6 +7,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Report assets (Vehga logo). Without this the folder never reaches the
+         publish output, and the header silently falls back to plain text. -->
+    <Content Include="png\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Azure.Storage.Blobs" Version="12.27.0" />
     <PackageReference Include="Azure.Storage.Queues" Version="12.25.0" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="8" />

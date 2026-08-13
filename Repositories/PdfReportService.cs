@@ -462,10 +462,11 @@ namespace Valuation.Api.Services
                     {
                         var trimmedPath   = Path.Combine(AppContext.BaseDirectory, "png", "vehga-logo-trimmed.png");
                         var absolutePath  = Path.Combine(AppContext.BaseDirectory, "png", "vehga-logo.png");
+                        // Resolved against the output directory only. Working-directory
+                        // fallbacks used to hide a missing asset on a dev machine while
+                        // the deployed service rendered text instead of the logo.
                         string? logoPath  = File.Exists(trimmedPath)  ? trimmedPath
                                           : File.Exists(absolutePath) ? absolutePath
-                                          : File.Exists("png/vehga-logo-trimmed.png") ? "png/vehga-logo-trimmed.png"
-                                          : File.Exists("png/vehga-logo.png")         ? "png/vehga-logo.png"
                                           : null;
                         if (logoPath != null)
                             logoRow.ConstantItem(140).Height(34).Image(logoPath).FitArea();
