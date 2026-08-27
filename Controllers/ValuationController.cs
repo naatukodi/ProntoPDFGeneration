@@ -16,6 +16,31 @@ public class ValuationController : ControllerBase
         _pdfService = pdfService;
     }
 
+    /// <summary>
+    /// One-off migration that pins every legacy document's reference number so the
+    /// brand prefix split cannot move it. Run with ?apply=false first to see the counts.
+    /// Safe to re-run: documents that already have a reference are skipped.
+    /// </summary>
+    [HttpPost("backfill-references")]
+    public async Task<IActionResult> BackfillReferences([FromQuery] bool apply = false, CancellationToken ct = default)
+    {
+        var r = await _pdfService.BackfillReferenceNumbersAsync(dryRun: !apply, ct);
+        return Ok(new
+        {
+            dryRun = !apply,
+            r.Scanned,
+            r.Assigned,
+            r.Collisions,
+            r.Written,
+            r.SkippedMissingKey,
+            r.Failed,
+            r.Examples,
+            message = apply
+                ? "References written. Existing reports keep the PM- number they were printed with."
+                : "Dry run only — re-send with ?apply=true to write."
+        });
+    }
+
     [HttpGet("{id}/report")]
     public async Task<IActionResult> GetReport(string id)
     {

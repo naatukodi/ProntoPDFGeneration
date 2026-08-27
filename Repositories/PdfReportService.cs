@@ -31,8 +31,36 @@ namespace Valuation.Api.Services
         private readonly BlobContainerClient? _blobContainer;
         private readonly string? _blobBaseUrl;
 
-        // Master Brand Colors matched to original design
-        private static readonly string BrandTeal  = "#009688";
+        /// <summary>Everything that differs between the two companies. Layout, spacing
+        /// and wording are shared — only identity changes.</summary>
+        private sealed record BrandTheme(
+            string Key, string Name, string Primary, string TintBg,
+            string LogoTrimmed, string LogoFull, string Watermark, string FooterNote);
+
+        private static readonly BrandTheme VehgaTheme = new(
+            "vehga", "VEHGA", "#009688", "#E6F5F3",
+            "vehga-logo-trimmed.png", "vehga-logo.png", "VEHGA VERIFIED",
+            "NOTE: THIS IS A DIGITALLY GENERATED REPORT, HENCE NO PHYSICAL SIGNATURE IS REQUIRED. VERIFIED VIA VEHGA SECURE CLOUD.");
+
+        // Pronto's green is darkened from the logo's #02944E, which only reaches 3.9:1
+        // on white; #02763E clears WCAG AA and matches Vehga's contrast on the page.
+        private static readonly BrandTheme ProntoTheme = new(
+            "pronto", "PRONTO MOTO", "#02763E", "#E8F5EE",
+            "pronto-logo-trimmed.png", "pronto-logo-trimmed.png", "PRONTO VERIFIED",
+            "NOTE: THIS IS A DIGITALLY GENERATED REPORT, HENCE NO PHYSICAL SIGNATURE IS REQUIRED. VERIFIED VIA PRONTO SECURE CLOUD.");
+
+        // AsyncLocal rather than an instance field: the service may be registered as a
+        // singleton, and two reports for different brands can be generated concurrently.
+        private static readonly AsyncLocal<BrandTheme?> CurrentTheme = new();
+        private static BrandTheme Theme => CurrentTheme.Value ?? VehgaTheme;
+
+        private static BrandTheme ThemeFor(string? brand) =>
+            string.Equals(brand, "pronto", StringComparison.OrdinalIgnoreCase) ? ProntoTheme : VehgaTheme;
+
+        // Kept under the old name so the ~40 existing call sites need no edit; it now
+        // resolves per-document instead of being a fixed teal.
+        private static string BrandTeal => Theme.Primary;
+
         private static readonly string LabelSlate = "#64748B";
         private static readonly string ValueDark  = "#1a1a1a";
         private static readonly string MintBg     = "#F0FDF4";
@@ -79,7 +107,11 @@ namespace Valuation.Api.Services
 
         public async Task<byte[]> GeneratePdfAsync(ValuationDocument doc)
         {
-            var referenceNumber = GenerateReferenceNumber(doc);
+            // Set before anything composes: BrandTeal and the header/watermark/footer
+            // all read from this for the rest of the generation.
+            CurrentTheme.Value = ThemeFor(doc.Brand);
+
+            var referenceNumber = await EnsureReferenceNumberAsync(doc);
             var photoStreams     = await DownloadPhotosAsync(doc.PhotoUrls);
 
             // Fallback: chassis photos may be stored on InspectionDetails instead of PhotoUrls
@@ -180,7 +212,7 @@ namespace Valuation.Api.Services
                         text-anchor="middle" dominant-baseline="middle"
                         font-family="Helvetica, Arial, sans-serif"
                         font-size="48" font-weight="bold"
-                        fill="#808080" fill-opacity="0.015">VEHGA VERIFIED</text>
+                        fill="#808080" fill-opacity="0.015">{Theme.Watermark}</text>
                 </svg>
                 """;
         }
@@ -332,17 +364,189 @@ namespace Valuation.Api.Services
             catch { return Array.Empty<byte>(); }
         }
 
-        private string GenerateReferenceNumber(ValuationDocument doc)
+        // "PM" for Pronto Moto, "VG" for Vehga. Documents created before multi-brand
+        // have no Brand and are Vehga — but they already carry a persisted PM- reference
+        // from when the prefix was hardcoded, so they keep it. The result is a permanent
+        // mix of PM- and VG- across Vehga's history, which is the accepted price of not
+        // invalidating QR codes on reports already in customers' hands.
+        private static string BrandPrefix(string? brand) =>
+            string.Equals(brand, "pronto", StringComparison.OrdinalIgnoreCase) ? "PM" : "VG";
+
+        // The prefix every report carried before the brand split. Legacy documents must
+        // be backfilled with THIS, not with their brand's prefix: it is what was printed
+        // on them, and the QR resolves to reports/{reference}.pdf.
+        private const string LegacyPrefix = "PM";
+
+        // attempt 0 reproduces the original pre-collision-check hash exactly, so the
+        // backfill can recover the reference an existing report was printed with.
+        private static string ComposeReference(ValuationDocument doc, int attempt, string? forcePrefix = null)
         {
-            if (!string.IsNullOrWhiteSpace(doc.ReferenceNumber)) return doc.ReferenceNumber;
-            var input = $"{doc.VehicleDetails?.RegistrationNumber}|{doc.CreatedAt:yyyyMMdd}|{doc.id}";
+            var seed = $"{doc.VehicleDetails?.RegistrationNumber}|{doc.CreatedAt:yyyyMMdd}|{doc.id}";
+            if (attempt > 0) seed += $"|{attempt}";
+
             using var sha256 = SHA256.Create();
-            var h    = sha256.ComputeHash(Encoding.UTF8.GetBytes(input));
-            var num  = ((h[0] << 16) | (h[1] << 8) | h[2]) % 1_000_000;
+            var h      = sha256.ComputeHash(Encoding.UTF8.GetBytes(seed));
+            var num    = ((h[0] << 16) | (h[1] << 8) | h[2]) % 1_000_000;
             var letter = (char)('A' + h[3] % 26);
-            return $"PM-{num:D6}-{letter}";
+            return $"{forcePrefix ?? BrandPrefix(doc.Brand)}-{num:D6}-{letter}";
         }
 
+        private async Task<bool> ReferenceTakenAsync(string reference, string? excludeDocId)
+        {
+            var query = new QueryDefinition(
+                    "SELECT VALUE COUNT(1) FROM c WHERE c.ReferenceNumber = @ref AND c.id != @id")
+                .WithParameter("@ref", reference)
+                .WithParameter("@id", excludeDocId ?? string.Empty);
+
+            using var iterator = Container.GetItemQueryIterator<int>(query);
+            while (iterator.HasMoreResults)
+            {
+                var page = await iterator.ReadNextAsync();
+                if (page.FirstOrDefault() > 0) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Returns the document's permanent reference, assigning one the first time.
+        /// Once assigned it is never recomputed: the QR code encodes the blob path
+        /// reports/{reference}.pdf, so a changed reference orphans printed reports.
+        ///
+        /// The reference space is only 26 million (6 digits x 1 letter), so by the
+        /// birthday bound a collision is roughly 1% likely at ~720 reports and 50% at
+        /// ~6,000 — and a collision means one report silently overwrites another's blob
+        /// and its QR then serves the wrong vehicle. Hence the uniqueness check.
+        /// </summary>
+        private async Task<string> EnsureReferenceNumberAsync(ValuationDocument doc)
+        {
+            if (!string.IsNullOrWhiteSpace(doc.ReferenceNumber)) return doc.ReferenceNumber;
+
+            var reference = ComposeReference(doc, 0);
+            for (var attempt = 1; attempt <= 10; attempt++)
+            {
+                if (!await ReferenceTakenAsync(reference, doc.id)) break;
+                reference = ComposeReference(doc, attempt);
+            }
+
+            doc.ReferenceNumber = reference;
+            await PersistReferenceNumberAsync(doc, reference);
+            return reference;
+        }
+
+        /// <summary>
+        /// One-off migration: gives every document that predates persisted references the
+        /// exact reference it was already printed with, so the prefix split can't move it.
+        /// Uses the legacy PM- prefix deliberately — these reports are in customers' hands
+        /// with PM- QR codes regardless of which company they belong to.
+        /// Idempotent: documents that already have a reference are skipped.
+        /// </summary>
+        public async Task<BackfillResult> BackfillReferenceNumbersAsync(
+            bool dryRun = true, CancellationToken ct = default)
+        {
+            var result = new BackfillResult();
+            int scanned = 0, assigned = 0, collisions = 0;
+            var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // Existing references first, so the collision check sees them.
+            using (var it = Container.GetItemQueryIterator<string>(new QueryDefinition(
+                "SELECT VALUE c.ReferenceNumber FROM c WHERE IS_STRING(c.ReferenceNumber) AND LENGTH(c.ReferenceNumber) > 0")))
+            {
+                while (it.HasMoreResults)
+                    foreach (var r in await it.ReadNextAsync(ct))
+                        if (!string.IsNullOrWhiteSpace(r)) taken.Add(r);
+            }
+
+            using var docs = Container.GetItemQueryIterator<ValuationDocument>(new QueryDefinition(
+                "SELECT * FROM c WHERE NOT IS_DEFINED(c.ReferenceNumber) OR c.ReferenceNumber = null OR c.ReferenceNumber = ''"));
+
+            while (docs.HasMoreResults)
+            {
+                foreach (var doc in await docs.ReadNextAsync(ct))
+                {
+                    scanned++;
+                    var reference = ComposeReference(doc, 0, LegacyPrefix);
+                    for (var attempt = 1; attempt <= 10 && taken.Contains(reference); attempt++)
+                    {
+                        collisions++;
+                        reference = ComposeReference(doc, attempt, LegacyPrefix);
+                    }
+
+                    taken.Add(reference);
+                    assigned++;
+
+                    // A migration must not fail quietly: report exactly why a document
+                    // could not be written, or 21 of them vanish without explanation.
+                    if (string.IsNullOrWhiteSpace(doc.id) || string.IsNullOrWhiteSpace(doc.VehicleNumber))
+                    {
+                        result.SkippedMissingKey++;
+                        if (result.Examples.Count < 10)
+                            result.Examples.Add($"missing key: id={doc.id ?? "(null)"} vehicle={doc.VehicleNumber ?? "(null)"} applicant={doc.ApplicantContact ?? "(null)"}");
+                        continue;
+                    }
+
+                    if (dryRun) { result.Written++; continue; }
+
+                    try
+                    {
+                        await Container.PatchItemAsync<ValuationDocument>(
+                            doc.id,
+                            GetPk(doc.VehicleNumber, doc.ApplicantContact ?? string.Empty),
+                            new[] { PatchOperation.Set("/ReferenceNumber", reference) },
+                            cancellationToken: ct);
+                        result.Written++;
+                    }
+                    catch (CosmosException ex)
+                    {
+                        result.Failed++;
+                        if (result.Examples.Count < 10)
+                            result.Examples.Add($"{ex.StatusCode}: id={doc.id} pk={doc.VehicleNumber}|{doc.ApplicantContact}");
+                    }
+                }
+            }
+
+            result.Scanned = scanned;
+            result.Assigned = assigned;
+            result.Collisions = collisions;
+            return result;
+        }
+
+        public sealed class BackfillResult
+        {
+            public int Scanned { get; set; }
+            public int Assigned { get; set; }
+            public int Collisions { get; set; }
+            public int Written { get; set; }
+            /// <summary>Documents whose id or partition key is incomplete, so they cannot be patched.</summary>
+            public int SkippedMissingKey { get; set; }
+            public int Failed { get; set; }
+            public List<string> Examples { get; } = new();
+        }
+
+        private async Task PersistReferenceNumberAsync(ValuationDocument doc, string reference)
+        {
+            if (string.IsNullOrWhiteSpace(doc.id) || string.IsNullOrWhiteSpace(doc.VehicleNumber))
+                return;
+
+            try
+            {
+                await Container.PatchItemAsync<ValuationDocument>(
+                    doc.id,
+                    GetPk(doc.VehicleNumber, doc.ApplicantContact ?? string.Empty),
+                    new[] { PatchOperation.Set("/ReferenceNumber", reference) });
+            }
+            catch (CosmosException)
+            {
+                // Never fail PDF generation because the write-back failed: the caller
+                // still gets a valid report, and the next generation retries the patch.
+            }
+        }
+
+        /// <summary>
+        /// Normalises an inspection value to one of GOOD / AVERAGE / POOR / DAMAGED /
+        /// MISSING / NO / NA. Mirrors CONDITION_OPTIONS in the portal's
+        /// inspection-field-registry.ts and conditionOptions in the app's
+        /// inspection_field_registry.dart — keep the three in sync.
+        /// </summary>
         private string MapVerdict(string? input)
         {
             if (string.IsNullOrWhiteSpace(input)) return "NA";
@@ -351,6 +555,9 @@ namespace Valuation.Api.Services
             if (lower is "false" or "0" or "bad" or "poor")        return "POOR";
             if (lower == "no")                                        return "NO";
             if (lower is "average" or "fair")                        return "AVERAGE";
+            if (lower is "damaged" or "damage")                      return "DAMAGED";
+            if (lower.StartsWith("missing") || lower is "not present" or "absent") return "MISSING";
+            if (lower is "n/a" or "na" or "n.a." or "not applicable") return "NA";
             return input.ToUpper();
         }
 
@@ -365,8 +572,10 @@ namespace Valuation.Api.Services
                     case "GOOD": case "YES": scores.Add(8.5); break; // GOOD = 7-10 range → 8.5
                     case "AVERAGE":          scores.Add(5.5); break; // AVERAGE = 4-7 range → 5.5
                     case "POOR": case "BAD": scores.Add(2.5); break; // POOR = 1-4 range → 2.5
+                    case "DAMAGED":          scores.Add(2.0); break; // worse than POOR, better than absent
                     case "NO":               scores.Add(1.0); break;
-                    case "NA": break;
+                    case "MISSING":          scores.Add(0.5); break; // part is not on the vehicle
+                    case "NA": break;                                // not applicable — excluded from the average
                     default:
                         var m = Regex.Match(v, @"\d+(\.\d+)?");
                         if (m.Success && double.TryParse(m.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var n))
@@ -460,8 +669,8 @@ namespace Valuation.Api.Services
                 {
                     col.Item().Height(34).AlignLeft().Row(logoRow =>
                     {
-                        var trimmedPath   = Path.Combine(AppContext.BaseDirectory, "png", "vehga-logo-trimmed.png");
-                        var absolutePath  = Path.Combine(AppContext.BaseDirectory, "png", "vehga-logo.png");
+                        var trimmedPath   = Path.Combine(AppContext.BaseDirectory, "png", Theme.LogoTrimmed);
+                        var absolutePath  = Path.Combine(AppContext.BaseDirectory, "png", Theme.LogoFull);
                         // Resolved against the output directory only. Working-directory
                         // fallbacks used to hide a missing asset on a dev machine while
                         // the deployed service rendered text instead of the logo.
@@ -471,7 +680,7 @@ namespace Valuation.Api.Services
                         if (logoPath != null)
                             logoRow.ConstantItem(140).Height(34).Image(logoPath).FitArea();
                         else
-                            logoRow.AutoItem().Text("VEHGA").FontSize(24).Bold().FontColor(BrandTeal);
+                            logoRow.AutoItem().Text(Theme.Name).FontSize(24).Bold().FontColor(BrandTeal);
                     });
                 });
                 row.AutoItem().AlignRight().Column(col =>
@@ -502,7 +711,7 @@ namespace Valuation.Api.Services
         private void ComposeFooter(IContainer container, ValuationDocument doc)
         {
             container.PaddingTop(4).BorderTop(1).BorderColor("#E2E8F0").PaddingTop(6).AlignCenter()
-                .Text("NOTE: THIS IS A DIGITALLY GENERATED REPORT, HENCE NO PHYSICAL SIGNATURE IS REQUIRED. VERIFIED VIA VEHGA SECURE CLOUD.")
+                .Text(Theme.FooterNote)
                 .FontSize(5.5f).FontColor(LabelSlate).LetterSpacing(0.03f);
         }
 
@@ -584,7 +793,10 @@ namespace Valuation.Api.Services
                         layers.Layer().Svg(s => {
                             string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
                             string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""8"" fill=""#E6F5F3""/></svg>";
+                            // Tint follows the brand: this panel sits directly behind
+                            // BrandTeal text, so a fixed Vehga tint would leave a teal
+                            // plate under green lettering on a Pronto report.
+                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""8"" fill=""{Theme.TintBg}""/></svg>";
                         });
                         layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(6).AlignCenter()
                             .Text(vehicleName)
@@ -721,8 +933,9 @@ namespace Valuation.Api.Services
                             string badgeBg, badgeFg;
                             if (verdict is "GOOD" or "YES")              { badgeBg = "#D1FAE5"; badgeFg = "#065F46"; }
                             else if (verdict == "AVERAGE")               { badgeBg = "#FEF3C7"; badgeFg = "#92400E"; }
-                            else if (verdict is "POOR" or "BAD" or "NO") { badgeBg = "#FEE2E2"; badgeFg = "#991B1B"; }
-                            else                                         { badgeBg = "#D1FAE5"; badgeFg = "#065F46"; }
+                            else if (verdict is "POOR" or "BAD" or "NO" or "DAMAGED" or "MISSING")
+                                                                         { badgeBg = "#FEE2E2"; badgeFg = "#991B1B"; }
+                            else                                         { badgeBg = "#F1F5F9"; badgeFg = "#64748B"; }
 
                             table.Cell().PaddingVertical(3).Layers(cell =>
                             {
@@ -916,7 +1129,9 @@ namespace Valuation.Api.Services
                         });
                     });
 
-                    var secId = $"ID: V-{referenceNumber.Replace("PM-", "").Replace("-", "")}-SECURE";
+                    // Strip whatever brand prefix is in play, not just PM- — a VG-
+                    // reference would otherwise keep its prefix and produce "V-VG123456A-SECURE".
+                    var secId = $"ID: V-{Regex.Replace(referenceNumber, "^[A-Z]{2,3}-", "").Replace("-", "")}-SECURE";
                     col.Item().PaddingTop(2).AlignRight()
                         .Text(secId).FontSize(6).FontColor(Colors.Grey.Medium);
                 });
@@ -1631,7 +1846,8 @@ namespace Valuation.Api.Services
                             string pillBg, pillFg;
                             if (verdict is "GOOD" or "YES")              { pillBg = "#ECFDF5"; pillFg = "#059669"; }
                             else if (verdict == "AVERAGE")               { pillBg = "#FFF7ED"; pillFg = "#D97706"; }
-                            else if (verdict is "POOR" or "BAD" or "NO") { pillBg = "#FEF2F2"; pillFg = "#DC2626"; }
+                            else if (verdict is "POOR" or "BAD" or "NO" or "DAMAGED" or "MISSING")
+                                                                         { pillBg = "#FEF2F2"; pillFg = "#DC2626"; }
                             else                                         { pillBg = "#F1F5F9"; pillFg = "#64748B"; }
 
                             void BuildCell(IContainer c)
@@ -1867,17 +2083,35 @@ show(0);
                 ? new HashSet<string>(doc.SelectedGalleryPhotos)
                 : null;
 
+            // Tyres get their own unlabeled row below, and the chassis identification
+            // photos already render on page 2's regulatory cards.
+            var tyreSlotKeys = new[] { "TireFrontLeft", "TireFrontRight", "TireRearLeft", "TireRearRight" };
+            var reservedKeys = new HashSet<string>(
+                GalleryPhotoSlots.SelectMany(s => s.Keys)
+                    .Concat(tyreSlotKeys)
+                    .Concat(new[] { "ChassisVerification", "ChassisStencilTrace" }));
+
+            // Any other uploaded photo QC ticked — an alternate for a slot already
+            // filled, or a type the named slots never covered (Underbody, seats,
+            // working/operation shots, custom photos). Without this they could be
+            // selected on the QC page but never reached the report.
+            var extraSlots = photos.Keys
+                .Where(k => !reservedKeys.Contains(k))
+                .Where(k => selectedKeys != null && selectedKeys.Contains(k))
+                .OrderBy(k => k, StringComparer.OrdinalIgnoreCase)
+                .Select(k => (Label: HumanizePhotoKey(k), Keys: new[] { k }))
+                .ToArray();
+
             // All labeled gallery photos flow through one continuous table (2 per row).
             // QuestPDF paginates a Table's rows across pages automatically, so this
             // naturally packs ~6 photos per page instead of forcing fixed category
             // pages that leave mostly-empty pages when few photos are selected.
             RenderPhotoTable(main.Item().PaddingTop(4).Section("PhotoGalleryTarget"),
-                GalleryPhotoSlots, doc, photos, selectedKeys);
+                GalleryPhotoSlots.Concat(extraSlots).ToArray(), doc, photos, selectedKeys);
 
             // Tyres: all uploaded (and selected, if a selection is set) tyre photos in one unlabeled row of four.
             // Flows directly after the photo table — same page if there's room, a new page otherwise.
-            var tyreKeys = new[] { "TireFrontLeft", "TireFrontRight", "TireRearLeft", "TireRearRight" };
-            var tyrePhotos = tyreKeys
+            var tyrePhotos = tyreSlotKeys
                 .Where(photos.ContainsKey)
                 .Where(k => selectedKeys == null || selectedKeys.Contains(k))
                 .Select(k => photos[k]).ToList();

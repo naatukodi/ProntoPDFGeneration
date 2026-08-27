@@ -1,0 +1,15 @@
+# Build output. These were tracked before this file existed, which is how a built
+# copy of appsettings.json -- carrying a live Cosmos key and blob connection
+# string -- ended up in the repository. Untracking those is a separate change:
+# the values are already in history and need rotating regardless.
+bin/
+obj/
+
+# Local configuration. Real secrets belong in Azure app settings, never here.
+appsettings.Development.json
+appsettings.Local.json
+*.user
+
+.vs/
+.vscode/
+*.zip

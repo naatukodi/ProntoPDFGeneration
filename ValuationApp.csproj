@@ -4,6 +4,11 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Skip the native apphost.exe in Debug: the project lives under a OneDrive-synced
+         folder, which locks apphost.exe during `dotnet run` (MSB4018 access-denied).
+         The app still runs via `dotnet run`. Release/deploy is unaffected. -->
+    <UseAppHost Condition="'$(Configuration)' == 'Debug'">false</UseAppHost>
   </PropertyGroup>
 
   <ItemGroup>

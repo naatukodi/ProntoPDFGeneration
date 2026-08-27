@@ -7,7 +7,14 @@ public class ValuationDocument
     public string? id { get; set; }
     public string TypeOfVal { get; set; } = "ValuationReport";
     public string ReportRequestedBy { get; set; } = "Valuation Team";
+    // Assigned once, on first PDF generation, then never recomputed — the QR code and
+    // the blob path are both keyed off it, so a printed report has to keep resolving.
     public string ReferenceNumber { get; set; } = "";
+
+    // Which company the case belongs to: "vehga" or "pronto". Null on every document
+    // created before multi-brand shipped, which is Vehga by definition.
+    public string? Brand { get; set; }
+
     public string dateOfValuation { get; set; } = DateTime.UtcNow.ToString("yyyy-MM-dd");
     
     // --- Added properties for the PDF generation links ---
