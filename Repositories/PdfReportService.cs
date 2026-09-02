@@ -886,20 +886,6 @@ namespace Valuation.Api.Services
                         });
                     });
 
-                    col.Item().PaddingTop(5).Layers(layers =>
-                    {
-                        layers.Layer().Svg(s => {
-                            string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
-                            string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            // Tint follows the brand: this panel sits directly behind
-                            // BrandTeal text, so a fixed Vehga tint would leave a teal
-                            // plate under green lettering on a Pronto report.
-                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""8"" fill=""{Theme.TintBg}""/></svg>";
-                        });
-                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(6).AlignCenter()
-                            .Text(vehicleName)
-                            .FontSize(8).ExtraBold().FontColor(BrandTeal);
-                    });
                 });
 
                 row.ConstantItem(12);
@@ -963,28 +949,47 @@ namespace Valuation.Api.Services
                         });
                     });
 
-                    // Chassis punch, as recorded at QC and confirmed at final report.
-                    // Sits under the value because it qualifies it: a re-punched or
-                    // tampered chassis is the one finding that changes what the
-                    // number is worth to a lender.
-                    var punch = ChassisPunchChip(doc);
-                    cards.Item().PaddingTop(6).Layers(layers =>
-                    {
-                        layers.Layer().Svg(size => {
-                            string w = size.Width.ToString("F1", CultureInfo.InvariantCulture);
-                            string h = size.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""{punch.Bg}"" stroke=""{punch.Stroke}"" stroke-width=""1""/></svg>";
-                        });
-                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).Row(r =>
-                        {
-                            r.RelativeItem().AlignMiddle()
-                                .Text("CHASSIS PUNCH")
-                                .FontSize(7.5f).ExtraBold().FontColor("#64748B").LetterSpacing(0.04f);
-                            r.AutoItem().AlignMiddle()
-                                .Text(punch.Label)
-                                .FontSize(8.5f).ExtraBold().FontColor(punch.Color);
-                        });
+                });
+            });
+
+            // Vehicle name and chassis punch share one line beneath the photo and
+            // the value cards. Both were previously the last item of their own
+            // column, which only lined them up by coincidence of column height —
+            // a row makes it exact and keeps each box its column's width.
+            main.Item().PaddingTop(5).Row(row =>
+            {
+                row.RelativeItem(7).Layers(layers =>
+                {
+                    layers.Layer().Svg(s => {
+                        string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
+                        string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
+                        // Tint follows the brand: this panel sits directly behind
+                        // BrandTeal text, so a fixed Vehga tint would leave a teal
+                        // plate under green lettering on a Pronto report.
+                        return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""8"" fill=""{Theme.TintBg}""/></svg>";
                     });
+                    layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(6).AlignMiddle().AlignCenter()
+                        .Text(vehicleName)
+                        .FontSize(8).ExtraBold().FontColor(BrandTeal);
+                });
+
+                row.ConstantItem(12);
+
+                // Chassis punch, as recorded at QC and confirmed at final report.
+                var punch = ChassisPunchChip(doc);
+                row.RelativeItem(5).Layers(layers =>
+                {
+                    layers.Layer().Svg(size => {
+                        string w = size.Width.ToString("F1", CultureInfo.InvariantCulture);
+                        string h = size.Height.ToString("F1", CultureInfo.InvariantCulture);
+                        return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""{punch.Bg}"" stroke=""{punch.Stroke}"" stroke-width=""1""/></svg>";
+                    });
+                    layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).AlignMiddle().AlignCenter()
+                        .Text(t =>
+                        {
+                            t.Span("CHASSIS PUNCH: ").FontSize(8).ExtraBold().FontColor("#64748B");
+                            t.Span(punch.Label).FontSize(8).ExtraBold().FontColor(punch.Color);
+                        });
                 });
             });
 
@@ -1273,8 +1278,8 @@ namespace Valuation.Api.Services
 
                     // The approver's valuer licence, the same on every report — it
                     // identifies the person who signed off, not the case.
-                    col.Item().PaddingTop(2).AlignRight()
-                        .Text($"License No: {ApproverLicenseNo}").FontSize(6).FontColor(Colors.Grey.Medium);
+                    col.Item().PaddingTop(3).AlignRight()
+                        .Text($"License No: {ApproverLicenseNo}").FontSize(8).SemiBold().FontColor(LabelSlate);
                 });
             });
         }
