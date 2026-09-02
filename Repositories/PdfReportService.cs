@@ -37,6 +37,9 @@ namespace Valuation.Api.Services
             string Key, string Name, string Primary, string TintBg,
             string LogoTrimmed, string LogoFull, string Watermark, string FooterNote);
 
+        /// <summary>Valuer licence of the approver named on every report's sign-off.</summary>
+        private const string ApproverLicenseNo = "74183";
+
         private static readonly BrandTheme VehgaTheme = new(
             "vehga", "VEHGA", "#009688", "#E6F5F3",
             "vehga-logo-trimmed.png", "vehga-logo.png", "VEHGA VERIFIED",
@@ -596,7 +599,7 @@ namespace Valuation.Api.Services
             var ins = doc.InspectionDetails;
             if (ins != null)
             {
-                var vk = NormVehicleTypeKey(doc.Stakeholder?.ValuationType);
+                var vk = ResolveVehicleTypeKey(doc);
                 if (!PdfFieldRegistry.TryGetValue(vk, out var allSections) || allSections.Length == 0)
                     allSections = PdfFieldRegistry["cv"];
 
@@ -619,6 +622,101 @@ namespace Valuation.Api.Services
                   : score >= 4.0 ? "#D97706"   // AVERAGE range
                   : "#DC2626";                  // POOR range
             return ($"{score.ToString("F1", CultureInfo.InvariantCulture)}/10", c);
+        }
+
+        /// <summary>
+        /// How the duplicate check reads on the report.
+        ///
+        /// Reflects the real check the case flow runs — other cases matching this
+        /// vehicle, engine or chassis — not the QC checklist's "valDedupe", which
+        /// is the VAHAN blacklist flag and answers a different question.
+        ///
+        /// A match is stated as a count, never as "DUPLICATE". The check is scoped
+        /// to this company and excludes this case, so a match means the vehicle has
+        /// been through here before — often legitimately, on a re-valuation or on a
+        /// repo following a retail. The report reports it; it does not accuse.
+        ///
+        /// Null (never checked) reads PENDING rather than clean: asserting a vehicle
+        /// is clear on no evidence is the one answer this must not give.
+        /// </summary>
+        private static (string Label, string Bg, string Stroke, string Color, string Icon) DedupeChip(ValuationDocument doc)
+        {
+            var matches = doc.DedupeCheck?.MatchCount;
+
+            var label = matches is null ? "PENDING"
+                      : matches == 0    ? "VERIFIED CLEAN"
+                      : matches == 1    ? "1 PRIOR CASE"
+                      :                   $"{matches} PRIOR CASES";
+
+            var clean = matches == 0;
+            var flag  = matches > 0;
+
+            return (
+                label,
+                clean ? "#ECFDF5" : flag ? "#FFFBEB" : "#F1F5F9",
+                clean ? "#A7F3D0" : flag ? "#FDE68A" : "#E2E8F0",
+                clean ? MintText  : flag ? "#B45309" : "#64748B",
+                clean ? @"<path d=""M8 12l3 3 5-6"" stroke-linecap=""round"" stroke-linejoin=""round""/>"
+              : flag  ? @"<path d=""M12 7v6M12 16.5v.5"" stroke-linecap=""round""/>"
+              :         @"<path d=""M8 12h8"" stroke-linecap=""round""/>"
+            );
+        }
+
+        /// <summary>
+        /// How the chassis punch reads on the cover, under the market value.
+        ///
+        /// Source is the QC officer's own entry — the chassis punch pills on the QC
+        /// page write "Original" / "Re-Punched" / "Tampered" onto QualityControl,
+        /// and the approver sees the same value on the final report page before
+        /// approving. Nothing derives it, so a case where QC never recorded the
+        /// punch prints NOT RECORDED rather than guessing at the metal.
+        ///
+        /// Colours follow severity: original is clean, re-punched is a caution, and
+        /// tampered is a rejection — the same reading the QC pills give on screen.
+        /// </summary>
+        private static (string Label, string Bg, string Stroke, string Color) ChassisPunchChip(ValuationDocument doc)
+        {
+            var raw = (doc.QualityControl?.ChassisPunch ?? string.Empty).Trim();
+            var key = raw.ToUpperInvariant().Replace("-", "").Replace(" ", "");
+
+            return key switch
+            {
+                "ORIGINAL"  => ("ORIGINAL",     "#ECFDF5", "#A7F3D0", MintText),
+                "REPUNCHED" => ("RE-PUNCHED",   "#FFFBEB", "#FDE68A", "#B45309"),
+                "TAMPERED"  => ("TAMPERED",     "#FEF2F2", "#FECACA", "#DC2626"),
+                ""          => ("NOT RECORDED", "#F1F5F9", "#E2E8F0", "#64748B"),
+                _           => (raw.ToUpperInvariant(), "#F1F5F9", "#E2E8F0", "#64748B")
+            };
+        }
+
+        /// <summary>
+        /// How the VAHAN blacklist check reads on the report.
+        ///
+        /// Answers "is this vehicle blacklisted?", so YES is the bad answer and NO
+        /// is the good one — the colours carry that, green for NO and red for YES,
+        /// because a glance at this chip must not be able to invert its meaning.
+        ///
+        /// Source is the QC checklist's "valDedupe" — the key is historical and kept
+        /// so saved verdicts are not orphaned; what it records is the blacklist flag
+        /// VAHAN returned, which the reviewer can override on the QC page.
+        /// Never checked reads PENDING rather than NO.
+        /// </summary>
+        private static (string Label, string Bg, string Stroke, string Color, string Icon) BlacklistChip(ValuationDocument doc)
+        {
+            var verdict = doc.QualityControl?.QcChecklist?.GetValueOrDefault("valDedupe");
+
+            var listed = verdict == "fail";   // fail = VAHAN reports it blacklisted
+            var clear  = verdict == "pass";
+
+            return (
+                clear ? "NO" : listed ? "YES" : "PENDING",
+                clear ? "#ECFDF5" : listed ? "#FEF2F2" : "#F1F5F9",
+                clear ? "#A7F3D0" : listed ? "#FECACA" : "#E2E8F0",
+                clear ? MintText  : listed ? "#DC2626" : "#64748B",
+                clear ? @"<path d=""M8 12l3 3 5-6"" stroke-linecap=""round"" stroke-linejoin=""round""/>"
+              : listed ? @"<path d=""M9 9l6 6M15 9l-6 6"" stroke-linecap=""round""/>"
+              :          @"<path d=""M8 12h8"" stroke-linecap=""round""/>"
+            );
         }
 
         private string SafeFormat(string? value, string def = "-") =>
@@ -825,15 +923,19 @@ namespace Valuation.Api.Services
                             c.Item().AlignCenter().Height(82)
                                 .Svg(size => GenerateScoreGaugeSvg(size, gaugeScore));
 
+                            // Was a hard-coded "VERIFIED CLEAN" on every report, whatever
+                            // the case held. Now it states the duplicate check's result,
+                            // same source as the DEDUPE chip further down the page.
+                            var gaugeDedupe = DedupeChip(doc);
                             c.Item().AlignCenter().PaddingTop(2).Layers(badgeLayers =>
                             {
                                 badgeLayers.Layer().Svg(s => {
                                     string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
                                     string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                                    return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""#FFFFFF"" stroke=""{BrandTeal}"" stroke-width=""1.5""/></svg>";
+                                    return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""#FFFFFF"" stroke=""{gaugeDedupe.Color}"" stroke-width=""1.5""/></svg>";
                                 });
                                 badgeLayers.PrimaryLayer().PaddingVertical(4).PaddingHorizontal(12)
-                                    .Text("VERIFIED CLEAN").FontSize(8).ExtraBold().FontColor(BrandTeal);
+                                    .Text(gaugeDedupe.Label).FontSize(8).ExtraBold().FontColor(gaugeDedupe.Color);
                             });
                         });
                     });
@@ -858,6 +960,29 @@ namespace Valuation.Api.Services
                             c.Item().PaddingTop(4).AlignCenter()
                                 .Text("Calculated based on current market trends")
                                 .FontSize(7).Italic().FontColor(Colors.White);
+                        });
+                    });
+
+                    // Chassis punch, as recorded at QC and confirmed at final report.
+                    // Sits under the value because it qualifies it: a re-punched or
+                    // tampered chassis is the one finding that changes what the
+                    // number is worth to a lender.
+                    var punch = ChassisPunchChip(doc);
+                    cards.Item().PaddingTop(6).Layers(layers =>
+                    {
+                        layers.Layer().Svg(size => {
+                            string w = size.Width.ToString("F1", CultureInfo.InvariantCulture);
+                            string h = size.Height.ToString("F1", CultureInfo.InvariantCulture);
+                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""{punch.Bg}"" stroke=""{punch.Stroke}"" stroke-width=""1""/></svg>";
+                        });
+                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).Row(r =>
+                        {
+                            r.RelativeItem().AlignMiddle()
+                                .Text("CHASSIS PUNCH")
+                                .FontSize(7.5f).ExtraBold().FontColor("#64748B").LetterSpacing(0.04f);
+                            r.AutoItem().AlignMiddle()
+                                .Text(punch.Label)
+                                .FontSize(8.5f).ExtraBold().FontColor(punch.Color);
                         });
                     });
                 });
@@ -898,7 +1023,7 @@ namespace Valuation.Api.Services
                     cd.RelativeColumn(4); cd.RelativeColumn(5);
                 });
                 AddAssetRow(table, "OWNER",            doc.VehicleDetails?.OwnerName?.ToUpper() ?? "-",      "FUEL TYPE",         doc.VehicleDetails?.Fuel?.ToUpper() ?? "-");
-                AddAssetRow(table, "APPLICANT",        doc.Stakeholder?.Applicant?.Name?.ToUpper() ?? "-",   "TRANSMISSION",      "MANUAL");
+                AddAssetRow(table, "APPLICANT",        doc.Stakeholder?.Applicant?.Name?.ToUpper() ?? "-",   "TRANSMISSION",      SafeFormat(doc.InspectionDetails?.TransmissionType?.ToUpper()));
                 AddAssetRow(table, "CHASSIS NUMBER",   doc.VehicleDetails?.ChassisNumber?.ToUpper() ?? "-",  "COLOUR",            doc.VehicleDetails?.Colour?.ToUpper() ?? "-");
                 AddAssetRow(table, "ENGINE NUMBER",    doc.VehicleDetails?.EngineNumber?.ToUpper() ?? "-",   "ODO METER",         doc.VehicleDetails?.Odometer?.ToString() ?? doc.InspectionDetails?.Odometer?.ToString() ?? "-");
                 AddAssetRow(table, "MANUFACTURE YEAR",
@@ -976,31 +1101,48 @@ namespace Valuation.Api.Services
 
                 outerRow.AutoItem().Column(linkCol =>
                 {
-                    // Dedupe status comes from the QC checklist ("valDedupe": pass/fail)
-                    var dedupe = doc.QualityControl?.QcChecklist?.GetValueOrDefault("valDedupe");
-                    string dedupeLabel  = dedupe == "pass" ? "VERIFIED CLEAN" : dedupe == "fail" ? "FLAGGED" : "PENDING";
-                    string dedupeBg     = dedupe == "pass" ? "#ECFDF5" : dedupe == "fail" ? "#FEF2F2" : "#F1F5F9";
-                    string dedupeStroke = dedupe == "pass" ? "#A7F3D0" : dedupe == "fail" ? "#FECACA" : "#E2E8F0";
-                    string dedupeColor  = dedupe == "pass" ? MintText  : dedupe == "fail" ? "#DC2626" : "#64748B";
-                    string dedupeIcon   = dedupe == "pass" ? @"<path d=""M8 12l3 3 5-6"" stroke-linecap=""round"" stroke-linejoin=""round""/>"
-                                        : dedupe == "fail" ? @"<path d=""M9 9l6 6M15 9l-6 6"" stroke-linecap=""round""/>"
-                                        : @"<path d=""M8 12h8"" stroke-linecap=""round""/>";
+                    var (dedupeLabel, dedupeBg, dedupeStroke, dedupeColor, dedupeIcon) = DedupeChip(doc);
 
                     linkCol.Item().PaddingBottom(5).Layers(layers =>
                     {
                         layers.Layer().Svg(s => {
                             string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
                             string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""12"" fill=""{dedupeBg}"" stroke=""{dedupeStroke}"" stroke-width=""1""/></svg>";
+                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""{dedupeBg}"" stroke=""{dedupeStroke}"" stroke-width=""1""/></svg>";
                         });
-                        layers.PrimaryLayer().PaddingVertical(4).PaddingHorizontal(8).Row(r =>
+                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).Row(r =>
                         {
                             r.AutoItem().AlignMiddle().Width(10).Height(10)
                                 .Svg(_ => $@"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""{dedupeColor}"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""10""/>{dedupeIcon}</svg>");
-                            r.ConstantItem(4);
+                            r.ConstantItem(6);
                             r.AutoItem().AlignMiddle().Text(t => {
                                 t.Span("DEDUPE: ").FontSize(7).ExtraBold().FontColor(ValueDark);
                                 t.Span(dedupeLabel).FontSize(7).ExtraBold().FontColor(dedupeColor);
+                            });
+                        });
+                    });
+
+                    // Blacklist, stacked under dedupe. Two separate questions —
+                    // "has this vehicle been through here before" and "does VAHAN
+                    // report it stolen" — which shared one chip and one label until
+                    // they were untangled.
+                    var (blLabel, blBg, blStroke, blColor, blIcon) = BlacklistChip(doc);
+
+                    linkCol.Item().PaddingBottom(5).Layers(layers =>
+                    {
+                        layers.Layer().Svg(s => {
+                            string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
+                            string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
+                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""{blBg}"" stroke=""{blStroke}"" stroke-width=""1""/></svg>";
+                        });
+                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).Row(r =>
+                        {
+                            r.AutoItem().AlignMiddle().Width(10).Height(10)
+                                .Svg(_ => $@"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""{blColor}"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""10""/>{blIcon}</svg>");
+                            r.ConstantItem(6);
+                            r.AutoItem().AlignMiddle().Text(t => {
+                                t.Span("BLACKLIST: ").FontSize(7).ExtraBold().FontColor(ValueDark);
+                                t.Span(blLabel).FontSize(7).ExtraBold().FontColor(blColor);
                             });
                         });
                     });
@@ -1116,24 +1258,23 @@ namespace Valuation.Api.Services
                         badge.Layer().Svg(s => {
                             string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
                             string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}"" rx=""10"" fill=""#F0FDF4"" stroke=""#A7F3D0"" stroke-width=""1""><rect width=""{w}"" height=""{h}"" rx=""10"" fill=""#F0FDF4"" stroke=""#A7F3D0"" stroke-width=""1""/></svg>";
+                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""#F0FDF4"" stroke=""#A7F3D0"" stroke-width=""1""/></svg>";
                         });
-                        badge.PrimaryLayer().PaddingVertical(3).PaddingHorizontal(8).Row(r =>
+                        badge.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).Row(r =>
                         {
                             r.AutoItem().AlignMiddle()
                                 .Text("AUDIT STATUS: CERTIFIED")
                                 .FontSize(7).ExtraBold().FontColor(MintText);
-                            r.ConstantItem(4);
+                            r.ConstantItem(6);
                             r.AutoItem().AlignMiddle().Width(10).Height(10)
                                 .Svg(_ => @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#059669"" stroke-width=""2""><path d=""M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z""/><path d=""M9 12l2 2 4-4""/></svg>");
                         });
                     });
 
-                    // Strip whatever brand prefix is in play, not just PM- — a VG-
-                    // reference would otherwise keep its prefix and produce "V-VG123456A-SECURE".
-                    var secId = $"ID: V-{Regex.Replace(referenceNumber, "^[A-Z]{2,3}-", "").Replace("-", "")}-SECURE";
+                    // The approver's valuer licence, the same on every report — it
+                    // identifies the person who signed off, not the case.
                     col.Item().PaddingTop(2).AlignRight()
-                        .Text(secId).FontSize(6).FontColor(Colors.Grey.Medium);
+                        .Text($"License No: {ApproverLicenseNo}").FontSize(6).FontColor(Colors.Grey.Medium);
                 });
             });
         }
@@ -1358,6 +1499,9 @@ namespace Valuation.Api.Services
         // ──────────────────────────────────────────────
 
         // ── PDF inspection-field registry (mirrors inspection-field-registry.ts) ──
+        // Every field is scored. Where an item does not apply to the vehicle the
+        // inspector answers N/A, which MapVerdict excludes from the average — that
+        // is the lever for "not a defect", rather than exempting field names here.
         private record FieldDef(string Label, string Key);
         private record SectionDef(string Name, FieldDef[] Fields);
 
@@ -1463,6 +1607,9 @@ namespace Valuation.Api.Services
             {
                 new("BASIC SYSTEMS", new FieldDef[] {
                     new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
+                    // Present in the VEHGA checklist (2W sheet, row 6) and collected by
+                    // the portal; it was missing here, so it was never printed or scored.
+                    new("CABIN ASSY","cabinAssy"),
                     new("BODY CONDITION","bodyCondition"),     new("STEERING SYSTEM","steeringSystem"),
                     new("BRAKE SYSTEM","brakeSystem"),         new("ELECTRICAL SYSTEM","electricalSystem"),
                     new("SUSPENSION SYSTEM","suspensionSystem"),new("FUEL SYSTEM","fuelSystem"),
@@ -1715,6 +1862,32 @@ namespace Valuation.Api.Services
             return typeof(InspectionDetails).GetProperty(pascal, BindingFlags.Public | BindingFlags.Instance)?.GetValue(ins)?.ToString();
         }
 
+        /// <summary>
+        /// Which inspection registry a case is printed and scored against.
+        ///
+        /// The vehicle type lives in VehicleSegment ("two-wheeler", "bus", …).
+        /// ValuationType holds Retail or Repo — the inspection type, not the
+        /// vehicle — and matches none of the cases in NormVehicleTypeKey, so
+        /// reading it alone resolved EVERY report to "cv" whatever was actually
+        /// inspected: a two-wheeler printed CV sections (load body, tail gate)
+        /// that the AVO was never asked about, while the 2W fields they did fill
+        /// in never appeared. ValuationType stays last only as a safety net for a
+        /// case whose segment was never set.
+        ///
+        /// Mirrors resolveVehicleType() in the portal's inspection pages, which
+        /// has always fallen back to vehicleSegment for exactly this reason.
+        /// </summary>
+        private static string ResolveVehicleTypeKey(ValuationDocument doc) =>
+            NormVehicleTypeKey(FirstNonBlank(
+                doc.VehicleSegment,
+                doc.Stakeholder?.VehicleSegment,
+                doc.Stakeholder?.ValuationType));
+
+        /// <summary>First value that is neither null nor blank. A segment stored
+        /// as "" is as absent as one stored as null, so ?? alone is not enough.</summary>
+        private static string? FirstNonBlank(params string?[] values) =>
+            values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
+
         private static string NormVehicleTypeKey(string? raw)
         {
             if (string.IsNullOrWhiteSpace(raw)) return "cv";
@@ -1754,7 +1927,7 @@ namespace Valuation.Api.Services
                 return;
             }
 
-            var vk = NormVehicleTypeKey(doc.Stakeholder?.ValuationType);
+            var vk = ResolveVehicleTypeKey(doc);
             if (!PdfFieldRegistry.TryGetValue(vk, out var allSections) || allSections.Length == 0)
                 allSections = PdfFieldRegistry["cv"];
 

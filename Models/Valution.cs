@@ -36,6 +36,8 @@ public class ValuationDocument
     public ValuationResponse? ValuationResponse { get; set; }
     public Dictionary<string, string> PhotoUrls { get; set; } = new();
 
+    public DedupeCheckRecord? DedupeCheck { get; set; }
+
     // Keys (from PhotoUrls) QC chose to include in the PDF gallery page.
     // Null/empty means "not set" — fall back to including everything available.
     public List<string>? SelectedGalleryPhotos { get; set; }
@@ -77,4 +79,16 @@ public class Document
     public string? Type { get; set; }
     public string? FilePath { get; set; }
     public DateTime UploadedAt { get; set; }
+}
+
+/// <summary>
+/// Outcome of the duplicate check, recorded by the case flow. Null on cases
+/// checked before this was stored — the report then says PENDING rather than
+/// asserting a vehicle is clean on no evidence.
+/// </summary>
+public class DedupeCheckRecord
+{
+    public int MatchCount { get; set; }
+    public string? MatchedOn { get; set; }
+    public DateTime CheckedAt { get; set; }
 }
