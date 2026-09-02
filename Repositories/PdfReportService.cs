@@ -676,7 +676,15 @@ namespace Valuation.Api.Services
         /// </summary>
         private static (string Label, string Bg, string Stroke, string Color) ChassisPunchChip(ValuationDocument doc)
         {
+            // Two places record the same finding. The QC pills write the word onto
+            // QualityControl.ChassisPunch AND the verdict onto the checklist's
+            // "docChassis" — but a case reviewed before those were wired together
+            // has only the checklist entry, and reading just the first field
+            // printed NOT RECORDED on a report the portal showed as ORIGINAL.
             var raw = (doc.QualityControl?.ChassisPunch ?? string.Empty).Trim();
+            if (raw.Length == 0)
+                raw = (doc.QualityControl?.QcChecklist?.GetValueOrDefault("docChassis") ?? string.Empty).Trim();
+
             var key = raw.ToUpperInvariant().Replace("-", "").Replace(" ", "");
 
             return key switch
@@ -1415,9 +1423,9 @@ namespace Valuation.Api.Services
 
                     row.RelativeItem().AlignMiddle().Column(c =>
                     {
-                        c.Item().Text(title).FontSize(9).Bold().FontColor(ValueDark);
+                        c.Item().Text(title).FontSize(10).Bold().FontColor(ValueDark);
                         if (!string.IsNullOrEmpty(details))
-                            c.Item().PaddingTop(3).Text(details).FontSize(7).FontColor(LabelSlate);
+                            c.Item().PaddingTop(3).Text(details).FontSize(8).FontColor(LabelSlate);
                     });
 
                     row.ConstantItem(120).AlignMiddle().AlignRight().Column(c =>
@@ -1427,12 +1435,12 @@ namespace Valuation.Api.Services
                             string bg    = isWarning ? "#FFF3E0" : "#ECFDF5";
                             string color = isWarning ? "#FB8C00" : "#059669";
                             c.Item().AlignRight().Background(bg).PaddingVertical(3).PaddingHorizontal(8)
-                                .Text(status).FontSize(7).Bold().FontColor(color);
+                                .Text(status).FontSize(8).Bold().FontColor(color);
                         }
                         if (!string.IsNullOrEmpty(expiry) && expiry != "EXP: ---")
-                            c.Item().AlignRight().PaddingTop(3).Text(expiry).FontSize(7).FontColor(LabelSlate);
+                            c.Item().AlignRight().PaddingTop(3).Text(expiry).FontSize(8).FontColor(LabelSlate);
                         else if (expiry == "EXP: ---")
-                            c.Item().AlignRight().PaddingTop(3).Text("---").FontSize(7).FontColor(LabelSlate);
+                            c.Item().AlignRight().PaddingTop(3).Text("---").FontSize(8).FontColor(LabelSlate);
                     });
                 });
             });
@@ -1480,9 +1488,9 @@ namespace Valuation.Api.Services
 
                     row.RelativeItem(3).AlignMiddle().Column(c =>
                     {
-                        c.Item().Text(title).FontSize(9).Bold().FontColor(ValueDark);
+                        c.Item().Text(title).FontSize(10).Bold().FontColor(ValueDark);
                         if (!string.IsNullOrEmpty(details))
-                            c.Item().PaddingTop(3).Text(details).FontSize(7).FontColor(LabelSlate);
+                            c.Item().PaddingTop(3).Text(details).FontSize(8).FontColor(LabelSlate);
                     });
 
                     row.RelativeItem(7).AlignMiddle().AlignRight().Element(c =>
@@ -1493,7 +1501,7 @@ namespace Valuation.Api.Services
                         if (photo != null)
                             c.Height(45).AlignCenter().AlignMiddle().Image(photo).FitArea();
                         else
-                            c.AlignCenter().AlignMiddle().Text("NO IMAGE").FontSize(8).FontColor(LabelSlate);
+                            c.AlignCenter().AlignMiddle().Text("NO IMAGE").FontSize(9).FontColor(LabelSlate);
                     });
                 });
             });
@@ -1993,7 +2001,7 @@ namespace Valuation.Api.Services
                         row.AutoItem().Width(12).Height(12).Svg(_ => iconSvg);
                         row.ConstantItem(5);
                         row.RelativeItem().AlignMiddle()
-                            .Text(title).FontColor(ValueDark).SemiBold().FontSize(8f);
+                            .Text(title).FontColor(ValueDark).SemiBold().FontSize(9f);
 
                         row.AutoItem().Height(14).Layers(badgeLayers =>
                         {
@@ -2003,7 +2011,7 @@ namespace Valuation.Api.Services
                                 return $@"<svg xmlns=""http://www.w3.org/2000/svg"" width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""7"" fill=""{ValueDark}""/></svg>";
                             });
                             badgeLayers.PrimaryLayer().PaddingHorizontal(6).AlignCenter().AlignMiddle()
-                                .Text($"SCORE: {scoreStr}").FontColor(Colors.White).FontSize(6f).Bold();
+                                .Text($"SCORE: {scoreStr}").FontColor(Colors.White).FontSize(7f).Bold();
                         });
                     });
 
@@ -2033,7 +2041,7 @@ namespace Valuation.Api.Services
                                 c.PaddingVertical(2.5f).Row(r =>
                                 {
                                     r.RelativeItem().AlignMiddle()
-                                        .Text(item.Key).FontSize(7f).FontColor(LabelSlate);
+                                        .Text(item.Key).FontSize(8f).FontColor(LabelSlate);
 
                                     r.AutoItem().Layers(vl =>
                                     {
@@ -2044,7 +2052,7 @@ namespace Valuation.Api.Services
                                         });
                                         vl.PrimaryLayer().PaddingVertical(2).PaddingHorizontal(6)
                                             .AlignCenter().AlignMiddle()
-                                            .Text(verdict).FontSize(7f).Bold().FontColor(pillFg);
+                                            .Text(verdict).FontSize(8f).Bold().FontColor(pillFg);
                                     });
                                 });
                             }
@@ -2417,14 +2425,14 @@ show(0);
             col.Item().Background(bg).BorderBottom(1).BorderColor("#F1F5F9")
                 .PaddingVertical(6).PaddingHorizontal(10).Row(row =>
             {
-                row.RelativeItem(2).AlignMiddle().Text(l1.ToUpper()).FontSize(7).FontColor(LabelSlate);
+                row.RelativeItem(2).AlignMiddle().Text(l1.ToUpper()).FontSize(8).FontColor(LabelSlate);
                 row.RelativeItem(3).AlignMiddle().AlignRight()
-                    .Text(v1?.ToUpper() ?? "---").FontSize(8).Bold()
+                    .Text(v1?.ToUpper() ?? "---").FontSize(9).Bold()
                     .FontColor(idx == 0 ? "#3B82F6" : ValueDark);
                 row.ConstantItem(16);
-                row.RelativeItem(2).AlignMiddle().Text(l2.ToUpper()).FontSize(7).FontColor(LabelSlate);
+                row.RelativeItem(2).AlignMiddle().Text(l2.ToUpper()).FontSize(8).FontColor(LabelSlate);
                 row.RelativeItem(3).AlignMiddle().AlignRight()
-                    .Text(v2?.ToUpper() ?? "---").FontSize(8).Bold().FontColor(ValueDark);
+                    .Text(v2?.ToUpper() ?? "---").FontSize(9).Bold().FontColor(ValueDark);
             });
         }
 
