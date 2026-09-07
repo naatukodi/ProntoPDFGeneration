@@ -161,6 +161,11 @@ namespace Valuation.Api.Services
                     page.DefaultTextStyle(x => x.FontFamily("Helvetica").FontSize(8).FontColor(Colors.Black)
                         .DisableFontFeature(FontFeatures.StandardLigatures));
 
+                    // Left as SVG deliberately. Its typeface is host-dependent like the gauge's
+                    // was, but this is a 1.5%-opacity wash where the face is imperceptible --
+                    // and QuestPDF's Rotate pivots on the corner rather than the centre, so
+                    // drawing it as text moved the watermark 130pt up the page. A visible
+                    // misplacement is a worse trade than an invisible font difference.
                     page.Background().Svg(size => GenerateWatermarkSvg(size));
                     page.Header().Element(c => ComposeHeader(c, doc, referenceNumber));
 
@@ -273,18 +278,33 @@ namespace Valuation.Api.Services
                   <path d="{bgPath}" fill="none" stroke="#E2E8F0"
                         stroke-width="{strokeW.ToString("F2", CultureInfo.InvariantCulture)}" stroke-linecap="round"/>
                   {fgArc}
-                  <text x="{cx.ToString("F2", CultureInfo.InvariantCulture)}" y="{numY.ToString("F2", CultureInfo.InvariantCulture)}"
-                        text-anchor="middle"
-                        font-family="Helvetica, Arial, sans-serif"
-                        font-size="{numSize.ToString("F2", CultureInfo.InvariantCulture)}" font-weight="900"
-                        fill="{BrandTeal}">{score.ToString("F1", CultureInfo.InvariantCulture)}</text>
-                  <text x="{cx.ToString("F2", CultureInfo.InvariantCulture)}" y="{subY.ToString("F2", CultureInfo.InvariantCulture)}"
-                        text-anchor="middle"
-                        font-family="Helvetica, Arial, sans-serif"
-                        font-size="{subSize.ToString("F2", CultureInfo.InvariantCulture)}" font-weight="bold"
-                        fill="#9CA3AF">/ 10</text>
                 </svg>
                 """;
+        }
+
+        /// <summary>
+        /// Where the gauge's two numbers belong, in points from the top of the gauge box.
+        ///
+        /// They used to be &lt;text&gt; inside the SVG, but Skia's SVG renderer ignores
+        /// font-family and draws with whatever the host's default typeface happens to be --
+        /// Segoe UI on one App Service worker and DejaVu SERIF on the next, which put the
+        /// report's most prominent number in a serif face after a redeploy. Drawn through
+        /// QuestPDF instead they are the bundled Lato, identical on every host.
+        ///
+        /// Lato's ascender+descender is exactly 1.2em, the same as QuestPDF's line box, so
+        /// the baseline sits one ascender (0.987em) below the line top. These return the
+        /// LINE TOP that puts each baseline where the SVG used to draw it.
+        /// </summary>
+        private static (float NumSize, float NumTop, float SubSize, float SubTop) ScoreGaugeTextLayout(float width, float height)
+        {
+            float cx = width / 2f, cy = height * 0.50f;
+            float radius  = Math.Min(cx, cy) * 0.82f;
+            float numSize = radius * 0.88f;
+            float subSize = radius * 0.30f;
+            float numY    = cy + numSize * 0.28f;          // baseline, as in the SVG
+            float subY    = numY + subSize * 1.2f;
+            const float AscenderEm = 0.987f;               // Lato hhea ascender 1974/2000
+            return (numSize, numY - numSize * AscenderEm, subSize, subY - subSize * AscenderEm);
         }
 
         // ──────────────────────────────────────────────
@@ -989,8 +1009,17 @@ namespace Valuation.Api.Services
                                 .FontSize(8).ExtraBold().FontColor(BrandTeal).LetterSpacing(0.04f);
 
                             var gaugeScore = CalculateOverallVehicleScore(doc);
-                            c.Item().AlignCenter().Height(82)
-                                .Svg(size => GenerateScoreGaugeSvg(size, gaugeScore));
+                            var gaugeText = ScoreGaugeTextLayout(206.25f, 82f);
+                            c.Item().Height(82).Layers(gaugeLayers =>
+                            {
+                                gaugeLayers.PrimaryLayer().AlignCenter()
+                                    .Svg(size => GenerateScoreGaugeSvg(size, gaugeScore));
+                                gaugeLayers.Layer().PaddingTop(gaugeText.NumTop).AlignCenter()
+                                    .Text(gaugeScore.ToString("F1", CultureInfo.InvariantCulture))
+                                    .FontSize(gaugeText.NumSize).ExtraBold().FontColor(BrandTeal);
+                                gaugeLayers.Layer().PaddingTop(gaugeText.SubTop).AlignCenter()
+                                    .Text("/ 10").FontSize(gaugeText.SubSize).Bold().FontColor("#9CA3AF");
+                            });
 
                             // Was a hard-coded "VERIFIED CLEAN" on every report, whatever
                             // the case held. Now it states the duplicate check's result,
