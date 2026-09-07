@@ -147,7 +147,19 @@ namespace Valuation.Api.Services
                     page.Size(PageSizes.A4);
                     page.Margin(20);
                     page.PageColor(Colors.White);
-                    page.DefaultTextStyle(x => x.FontFamily("Helvetica").FontSize(8).FontColor(Colors.Black));
+                    // Ligatures off. Lato's `liga` feature folds "ti", "tt" and "fi" into
+                    // single glyphs, and those glyphs have no cmap entry -- they exist only
+                    // as GSUB output -- so Skia's ToUnicode map, which it builds by reverse
+                    // cmap lookup, has no way to name them and leaves them out. A reader
+                    // then falls back to the raw glyph id: "inspection" came out as
+                    // "inspec<U+099E>on" (glyph 2462 read as a Bengali codepoint), and a
+                    // search for "inspection", "valuation" or "identified" found nothing in
+                    // any report we have ever issued. The "fi" case was quieter but no
+                    // better -- it mapped to U+FB01, so the text looked clean and still
+                    // failed the search. Drawing each letter as its own glyph costs a
+                    // little typographic polish and makes the report readable by machine.
+                    page.DefaultTextStyle(x => x.FontFamily("Helvetica").FontSize(8).FontColor(Colors.Black)
+                        .DisableFontFeature(FontFeatures.StandardLigatures));
 
                     page.Background().Svg(size => GenerateWatermarkSvg(size));
                     page.Header().Element(c => ComposeHeader(c, doc, referenceNumber));
@@ -625,6 +637,69 @@ namespace Valuation.Api.Services
         }
 
         /// <summary>
+        /// The four verdicts on the cover, read against the sheet the AVO was actually
+        /// given rather than one fixed property each.
+        ///
+        /// Every sheet names the same question differently -- the body is `loadBodyAssy`
+        /// on a truck, `bodyAssy` on a car, `bodyCondition` on a two-wheeler and
+        /// `bodyStructure` on a bus -- and the cover read only `bodyCondition`. That key
+        /// exists on the 2W sheet alone, so every commercial vehicle printed LOAD BODY =
+        /// NA while the answer sat on the checklist page as LOAD BODY ASSY. CABIN carried
+        /// the mirror image of the same fault (`cabin` is CV-only), so no vehicle type
+        /// could ever fill both cells. OTHER SYSTEMS was the literal string "GOOD" -- a
+        /// verdict no inspector gave, on the cover of every report ever issued.
+        ///
+        /// Candidates are filtered to the keys THIS vehicle's registry actually asks for,
+        /// so a stale value on a field belonging to another sheet -- a case whose segment
+        /// was corrected after inspection -- can never be printed.
+        /// </summary>
+        private (string? Cabin, string? Engine, string? Body, string Other) ResolveCoverVerdicts(ValuationDocument doc)
+        {
+            var ins = doc.InspectionDetails;
+            if (ins == null) return (null, null, null, "NA");
+
+            var vk = ResolveVehicleTypeKey(doc);
+            if (!PdfFieldRegistry.TryGetValue(vk, out var sections) || sections.Length == 0)
+                sections = PdfFieldRegistry["cv"];
+
+            var asked = sections.SelectMany(s => s.Fields)
+                                .Select(f => f.Key)
+                                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            string? FirstAnswered(params string[] candidates)
+            {
+                foreach (var key in candidates)
+                {
+                    if (!asked.Contains(key)) continue;
+                    var v = GetInsValue(ins, key);
+                    if (!string.IsNullOrWhiteSpace(v)) return v;
+                }
+                return null;
+            }
+
+            // Construction equipment has no body panel section, and neither a bus nor a
+            // tractor has a plain "cabin" item, so those resolve to nothing and print NA.
+            // That is the honest answer where asserting a verdict was not.
+            var cabin  = FirstAnswered("cabin", "cabinAssy", "cabinStructure", "driverCabin", "operatorPlatform");
+            var engine = FirstAnswered("engineCondition");
+            var body   = FirstAnswered("loadBodyAssy", "bodyAssy", "bodyCondition", "bodyStructure");
+
+            // OTHER SYSTEMS is a category, not one finding: summarise that section the way
+            // page 3 scores it, then name the band using the thresholds
+            // GetScoreDisplayFromDouble already uses, so cover and score cannot disagree.
+            var otherSection = sections.FirstOrDefault(s => s.Name == "OTHER SYSTEMS");
+            var other = "NA";
+            if (otherSection != null)
+            {
+                var score = CalculateSystemScoreOrNull(
+                    otherSection.Fields.ToDictionary(f => f.Label, f => GetInsValue(ins, f.Key)));
+                if (score.HasValue)
+                    other = score >= 7.0 ? "GOOD" : score >= 4.0 ? "AVERAGE" : "POOR";
+            }
+            return (cabin, engine, body, other);
+        }
+
+        /// <summary>
         /// How the duplicate check reads on the report.
         ///
         /// Reflects the real check the case flow runs — other cases matching this
@@ -1032,7 +1107,16 @@ namespace Valuation.Api.Services
             {
                 table.ColumnsDefinition(cd =>
                 {
-                    cd.RelativeColumn(4); cd.RelativeColumn(5);
+                    // 3/6, not 4/5. The labels here are short ("OWNER", "COLOUR") and were
+                    // sitting in a 123pt column while the values were cramped into 154pt --
+                    // enough that an ordinary name like GOTTUMUKKALA SREENIVASA VARMA wrapped
+                    // onto a second line, on both the OWNER and APPLICANT rows. That is 21.6pt
+                    // the cover has nowhere to put: it overflowed and stranded the sign-off's
+                    // last line, "License No", alone on a page of its own.
+                    // Asymmetric on purpose. Only the LEFT pair carries long values (owner
+                    // and applicant names); the right pair holds DIESEL / MANUAL / WHITE and
+                    // needs its label width for "OWNERSHIP NUMBER", which wraps at 3 units.
+                    cd.RelativeColumn(3); cd.RelativeColumn(6);
                     cd.RelativeColumn(4); cd.RelativeColumn(5);
                 });
                 AddAssetRow(table, "OWNER",            doc.VehicleDetails?.OwnerName?.ToUpper() ?? "-",      "FUEL TYPE",         doc.VehicleDetails?.Fuel?.ToUpper() ?? "-");
@@ -1100,13 +1184,14 @@ namespace Valuation.Api.Services
                             });
                         }
 
-                        VerdictCell("CABIN",        doc.InspectionDetails?.Cabin);
+                        var coverVerdicts = ResolveCoverVerdicts(doc);
+                        VerdictCell("CABIN",         coverVerdicts.Cabin);
                         table.Cell(); // spacer column
-                        VerdictCell("ENGINE",       doc.InspectionDetails?.EngineCondition);
+                        VerdictCell("ENGINE",        coverVerdicts.Engine);
 
-                        VerdictCell("LOAD BODY",    doc.InspectionDetails?.BodyCondition);
+                        VerdictCell("LOAD BODY",     coverVerdicts.Body);
                         table.Cell();
-                        VerdictCell("OTHER SYSTEMS","GOOD");
+                        VerdictCell("OTHER SYSTEMS", coverVerdicts.Other);
                     });
                 });
 
@@ -1367,8 +1452,14 @@ namespace Valuation.Api.Services
             var fitStat = DocumentStatus(vd?.FitnessNo, vd?.FitnessValidTo);
             var fitDetails = string.IsNullOrWhiteSpace(vd?.FitnessNo) ? "" : $"Certificate: {vd!.FitnessNo}";
 
+            // Spacing between cards, not PaddingBottom on each one. A trailing 12pt on the
+            // LAST card is space nothing occupies, but QuestPDF still has to fit it: on a
+            // report whose RTO value wrapped, the final chassis card ended at 787pt with a
+            // limit of ~796 and the padding pushed the requirement to 799, so the whole card
+            // was moved to a page of its own and every page after it renumbered.
             main.Item().Column(col =>
             {
+                col.Spacing(12);
                 AddRegulatoryCardSimple(col, "COMPREHENSIVE INSURANCE",
                     insDetails, insStat.Status, insStat.Expiry, insStat.Warn);
                 AddRegulatoryCardSimple(col, "HYPOTHECATION (STATUS)",
@@ -1400,7 +1491,7 @@ namespace Valuation.Api.Services
         private void AddRegulatoryCardSimple(ColumnDescriptor col,
             string title, string details, string status, string expiry, bool isWarning = false)
         {
-            col.Item().PaddingBottom(12).Layers(cardLayers =>
+            col.Item().Layers(cardLayers =>
             {
                 cardLayers.Layer().Svg(s => {
                     string wStr = s.Width.ToString("F1", CultureInfo.InvariantCulture);
@@ -1468,7 +1559,7 @@ namespace Valuation.Api.Services
         private void AddRegulatoryCardWithPhoto(ColumnDescriptor col,
             string title, string details, Dictionary<string, byte[]> photos, string photoKey)
         {
-            col.Item().PaddingBottom(12).Layers(cardLayers =>
+            col.Item().Layers(cardLayers =>
             {
                 cardLayers.Layer().Svg(s => {
                     string wStr = s.Width.ToString("F1", CultureInfo.InvariantCulture);
