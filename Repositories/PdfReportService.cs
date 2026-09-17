@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -624,6 +624,11 @@ namespace Valuation.Api.Services
         private double CalculateSystemScore(Dictionary<string, string?> items)
             => CalculateSystemScoreOrNull(items) ?? 8.0;
 
+        /// <summary>The fields of a section that count toward its score.</summary>
+        private Dictionary<string, string?> ScorableItems(SectionDef sec, InspectionDetails ins) =>
+            sec.Fields.Where(f => f.Scored)
+                      .ToDictionary(f => f.Label, f => GetInsValue(ins, f.Key));
+
         // Overall score = average of the same system card scores shown on page 3.
         // Sections without any inspection data are excluded from the average.
         private double CalculateOverallVehicleScore(ValuationDocument doc)
@@ -638,14 +643,81 @@ namespace Valuation.Api.Services
                 var sectionScores = new List<double>();
                 foreach (var sec in allSections)
                 {
-                    var items = sec.Fields.ToDictionary(f => f.Label, f => GetInsValue(ins, f.Key));
-                    var s = CalculateSystemScoreOrNull(items);
+                    if (!IsScored(sec)) continue;
+                    var s = CalculateSystemScoreOrNull(ScorableItems(sec, ins));
                     if (s.HasValue) sectionScores.Add(s.Value);
                 }
                 if (sectionScores.Any())
                     return Math.Round(sectionScores.Average(), 1);
             }
             return ParseScoreValue(doc.QualityControl?.OverallRating);
+        }
+
+        /// <summary>
+        /// One badge per system for the cover's INDIVIDUAL RATINGS grid.
+        ///
+        /// Driven off the same registry and the same scoring call as page 3's system
+        /// cards, so the cover cannot state a figure the detail page contradicts -- the
+        /// property the old banded verdicts were written to protect, kept here.
+        ///
+        /// Sections with no inspection data are dropped rather than shown as zero, and
+        /// unscored sections (OTHER SYSTEMS) never appear: the grid is captioned as
+        /// ratings, and a section the report does not score has no rating to give.
+        /// </summary>
+        private List<(string Name, double Score)> SystemRatings(ValuationDocument doc)
+        {
+            var result = new List<(string, double)>();
+            var ins = doc.InspectionDetails;
+            if (ins == null) return result;
+
+            var vk = ResolveVehicleTypeKey(doc);
+            if (!PdfFieldRegistry.TryGetValue(vk, out var sections) || sections.Length == 0)
+                sections = PdfFieldRegistry["cv"];
+
+            foreach (var sec in sections)
+            {
+                if (!IsScored(sec)) continue;
+                var score = CalculateSystemScoreOrNull(ScorableItems(sec, ins));
+                if (score.HasValue) result.Add((sec.Name, score.Value));
+            }
+            return result;
+        }
+
+        /// <summary>Ring, fill and ink for a score badge, on the bands the rest of the report uses.</summary>
+        private static (string Ring, string Fill, string Ink) ScoreBadgeColors(double score) =>
+            score >= 7.0 ? ("#1C8A4C", "#E3F7EA", "#14663A")
+          : score >= 4.0 ? ("#B3760C", "#FFF3D9", "#8A5A09")
+          :                ("#C0392B", "#FDE3E3", "#94271C");
+
+        /// <summary>
+        /// A rating tile: bordered cell holding a ringed score circle over its system name.
+        /// Fixed height so every tile in the grid lines up whether its name wraps or not.
+        /// </summary>
+        private void RatingTile(IContainer cell, string name, double score)
+        {
+            var (ring, fill, ink) = ScoreBadgeColors(score);
+            cell.Padding(1.5f).Layers(layers =>
+            {
+                layers.Layer().Svg(s =>
+                {
+                    string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
+                    string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
+                    return $@"<svg xmlns=""http://www.w3.org/2000/svg"" width=""{w}"" height=""{h}""><rect x=""0.5"" y=""0.5"" width=""{(s.Width - 1).ToString("F1", CultureInfo.InvariantCulture)}"" height=""{(s.Height - 1).ToString("F1", CultureInfo.InvariantCulture)}"" rx=""5"" fill=""#FBFDFC"" stroke=""#E3E8EA"" stroke-width=""1""/></svg>";
+                });
+                layers.PrimaryLayer().PaddingVertical(2).PaddingHorizontal(2).Column(c =>
+                {
+                    c.Item().AlignCenter().Width(21).Height(21).Layers(b =>
+                    {
+                        b.Layer().Svg(_ =>
+                            $@"<svg xmlns=""http://www.w3.org/2000/svg"" viewBox=""0 0 21 21""><circle cx=""10.5"" cy=""10.5"" r=""9.7"" fill=""{fill}"" stroke=""{ring}"" stroke-width=""1.4""/></svg>");
+                        b.PrimaryLayer().AlignCenter().AlignMiddle()
+                            .Text(score.ToString("F1", CultureInfo.InvariantCulture))
+                            .FontSize(7.5f).ExtraBold().FontColor(ink);
+                    });
+                    c.Item().PaddingTop(2).AlignCenter().AlignMiddle()
+                        .Text(name).FontSize(5.2f).ExtraBold().FontColor(LabelSlate).LineHeight(0.95f);
+                });
+            });
         }
 
         private (string Score, string Color) GetScoreDisplayFromDouble(double score)
@@ -704,19 +776,12 @@ namespace Valuation.Api.Services
             var engine = FirstAnswered("engineCondition");
             var body   = FirstAnswered("loadBodyAssy", "bodyAssy", "bodyCondition", "bodyStructure");
 
-            // OTHER SYSTEMS is a category, not one finding: summarise that section the way
-            // page 3 scores it, then name the band using the thresholds
-            // GetScoreDisplayFromDouble already uses, so cover and score cannot disagree.
-            var otherSection = sections.FirstOrDefault(s => s.Name == "OTHER SYSTEMS");
-            var other = "NA";
-            if (otherSection != null)
-            {
-                var score = CalculateSystemScoreOrNull(
-                    otherSection.Fields.ToDictionary(f => f.Label, f => GetInsValue(ins, f.Key)));
-                if (score.HasValue)
-                    other = score >= 7.0 ? "GOOD" : score >= 4.0 ? "AVERAGE" : "POOR";
-            }
-            return (cabin, engine, body, other);
+            // OTHER SYSTEMS used to be summarised here as a fourth cover verdict, banded
+            // from its section score. It is no longer scored, and a band on the cover is
+            // a score by another name, so the box was dropped rather than left printing
+            // a number the report no longer stands behind. The tuple keeps its shape so
+            // the caller's layout is unchanged; nothing renders it.
+            return (cabin, engine, body, "NA");
         }
 
         /// <summary>
@@ -726,10 +791,17 @@ namespace Valuation.Api.Services
         /// vehicle, engine or chassis — not the QC checklist's "valDedupe", which
         /// is the VAHAN blacklist flag and answers a different question.
         ///
-        /// A match is stated as a count, never as "DUPLICATE". The check is scoped
-        /// to this company and excludes this case, so a match means the vehicle has
-        /// been through here before — often legitimately, on a re-valuation or on a
-        /// repo following a retail. The report reports it; it does not accuse.
+        /// A match is stated as a count, never as "DUPLICATE". The check spans both
+        /// companies and excludes this case, so a match means the vehicle has been
+        /// through Vehga or Pronto before — often legitimately, on a re-valuation, on
+        /// a repo following a retail, or because it was inspected for both. The report
+        /// reports it; it does not accuse.
+        ///
+        /// The count is deliberately not split by company. Which company a match sits
+        /// in is shown in the portal, where someone can act on it; on the report a
+        /// match is a match. That is what makes VERIFIED CLEAN mean what a reader
+        /// takes it to mean — clean across both — at the cost of a legitimate
+        /// dual-brand case reading as a prior case, which is rare enough to accept.
         ///
         /// Null (never checked) reads PENDING rather than clean: asserting a vehicle
         /// is clear on no evidence is the one answer this must not give.
@@ -962,6 +1034,10 @@ namespace Valuation.Api.Services
             {
                 row.RelativeItem(7).Column(col =>
                 {
+                    // Original size, kept. The row is as tall as the right-hand column
+                    // either way, so the photo costs the page nothing -- narrowing it only
+                    // shrank the picture. Not ExtendVertical: that takes the whole
+                    // remaining page and pushes every later section onto a second one.
                     col.Item().AspectRatio(4 / 3f).Layers(l =>
                     {
                         l.PrimaryLayer().Element(c =>
@@ -1002,15 +1078,17 @@ namespace Valuation.Api.Services
                             string h = size.Height.ToString("F1", CultureInfo.InvariantCulture);
                             return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""16"" fill=""{MintBg}"" stroke=""#D1FAE5"" stroke-width=""1""/></svg>";
                         });
-                        layers.PrimaryLayer().Padding(10).Column(c =>
+                        layers.PrimaryLayer().Padding(6).Column(c =>
                         {
                             c.Item().AlignCenter()
                                 .Text("OVERALL VEHICLE SCORE")
                                 .FontSize(8).ExtraBold().FontColor(BrandTeal).LetterSpacing(0.04f);
 
                             var gaugeScore = CalculateOverallVehicleScore(doc);
-                            var gaugeText = ScoreGaugeTextLayout(206.25f, 82f);
-                            c.Item().Height(82).Layers(gaugeLayers =>
+                            // 64, not 82. The cover gained the ratings grid and the value
+                            // section; this is the least-missed 18pt on the page.
+                            var gaugeText = ScoreGaugeTextLayout(206.25f, 48f);
+                            c.Item().Height(48).Layers(gaugeLayers =>
                             {
                                 gaugeLayers.PrimaryLayer().AlignCenter()
                                     .Svg(size => GenerateScoreGaugeSvg(size, gaugeScore));
@@ -1038,26 +1116,58 @@ namespace Valuation.Api.Services
                         });
                     });
 
-                    cards.Item().PaddingVertical(5);
+                    cards.Item().PaddingVertical(3);
 
+                    // INDIVIDUAL RATINGS. This replaced the four banded verdict boxes
+                    // (CABIN / ENGINE / LOAD BODY / OTHER SYSTEMS): a figure per system
+                    // instead of a word per area, from the same scoring call page 3 uses.
+                    // The market value card that used to sit here has moved to its own
+                    // section at the foot of the page.
                     cards.Item().Layers(layers =>
                     {
                         layers.Layer().Svg(size => {
                             string w = size.Width.ToString("F1", CultureInfo.InvariantCulture);
                             string h = size.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""16"" fill=""{BrandTeal}""/></svg>";
+                            return $@"<svg width=""{w}"" height=""{h}""><rect x=""0.5"" y=""0.5"" width=""{(size.Width - 1).ToString("F1", CultureInfo.InvariantCulture)}"" height=""{(size.Height - 1).ToString("F1", CultureInfo.InvariantCulture)}"" rx=""12"" fill=""#FCFDFD"" stroke=""#E3E8EA"" stroke-width=""1""/></svg>";
                         });
-                        layers.PrimaryLayer().Padding(14).Column(c =>
+                        layers.PrimaryLayer().Padding(5).Column(c =>
                         {
-                            c.Item().AlignCenter()
-                                .Text("ESTIMATED MARKET VALUE")
-                                .FontSize(8).Bold().FontColor(Colors.White).LetterSpacing(0.04f);
-                            c.Item().PaddingTop(6).AlignCenter()
-                                .Text($"₹ {FormatIndianCurrency(doc.QualityControl?.ValuationAmount ?? 0)}")
-                                .FontSize(22).ExtraBold().FontColor(Colors.White);
-                            c.Item().PaddingTop(4).AlignCenter()
-                                .Text("Calculated based on current market trends")
-                                .FontSize(7).Italic().FontColor(Colors.White);
+                            c.Item().PaddingBottom(3).Row(t =>
+                            {
+                                t.AutoItem().AlignMiddle().Width(10).Height(10).Svg(_ =>
+                                    $@"<svg xmlns=""http://www.w3.org/2000/svg"" viewBox=""0 0 24 24"" fill=""none"" stroke=""{BrandTeal}"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z""/></svg>");
+                                t.ConstantItem(5);
+                                t.RelativeItem().AlignMiddle()
+                                    .Text("CONDITION VERDICT \u2014 INDIVIDUAL RATINGS")
+                                    .FontSize(7.5f).ExtraBold().FontColor(ValueDark).LetterSpacing(0.02f);
+                            });
+
+                            var ratings = SystemRatings(doc);
+                            if (ratings.Count == 0)
+                            {
+                                c.Item().PaddingVertical(16).AlignCenter()
+                                    .Text("NO INSPECTION DATA").FontSize(8).Bold().FontColor(LabelSlate);
+                                return;
+                            }
+
+                            // Four across, as the mockup has it. A count that is not a
+                            // multiple of four pads with empty cells, so the last row
+                            // leaves gaps instead of stretching the tiles that remain.
+                            const int Cols = 4;
+                            c.Item().Table(tbl =>
+                            {
+                                tbl.ColumnsDefinition(cd =>
+                                {
+                                    for (int i = 0; i < Cols; i++) cd.RelativeColumn();
+                                });
+                                foreach (var (name, score) in ratings)
+                                {
+                                    var n = name; var sc = score;
+                                    tbl.Cell().Element(cell => RatingTile(cell, n, sc));
+                                }
+                                for (int i = ratings.Count % Cols; i != 0 && i < Cols; i++)
+                                    tbl.Cell();
+                            });
                         });
                     });
 
@@ -1068,7 +1178,7 @@ namespace Valuation.Api.Services
             // the value cards. Both were previously the last item of their own
             // column, which only lined them up by coincidence of column height —
             // a row makes it exact and keeps each box its column's width.
-            main.Item().PaddingTop(5).Row(row =>
+            main.Item().PaddingTop(4).Row(row =>
             {
                 row.RelativeItem(7).Layers(layers =>
                 {
@@ -1105,224 +1215,200 @@ namespace Valuation.Api.Services
                 });
             });
 
-            main.Item().PaddingVertical(2);
+            main.Item().PaddingVertical(1.5f);
 
-            main.Item().BorderTop(1).BorderBottom(1).BorderColor("#E5E7EB")
-                .PaddingVertical(5).Table(table => 
+            // One row of four, not two rows of two. Stacking each label over its value
+            // lets all four sit side by side, which is part of what frees the vertical
+            // space the ratings grid above now takes.
+            var stripPlace = doc.InspectionDetails?.InspectionLocation?.ToUpper() ?? "-";
+            main.Item().Border(1).BorderColor("#E5E7EB")
+                .PaddingVertical(5).PaddingHorizontal(10).Row(row =>
             {
-                table.ColumnsDefinition(cd =>
+                // Not four equal quarters. CLIENT carries the longest value on the strip
+                // by a wide margin -- EQUITAS SMALL FINANCE BANK wraps at a quarter width,
+                // where a branch name and a date have room to spare.
+                void Cell(float weight, string label, string? value, bool divider)
                 {
-                    cd.RelativeColumn(3); cd.RelativeColumn(5);
-                    cd.RelativeColumn(3); cd.RelativeColumn(5);
-                });
-                AddClientInfoRow(table, "CLIENT",
-                    doc.Stakeholder?.Name?.ToUpper() ?? "-",
-                    "BRANCH",
-                    doc.InspectionDetails?.InspectionLocation?.ToUpper() ?? "-");
-                AddClientInfoRow(table, "DATE OF INSPECTION",
-                    doc.InspectionDetails?.DateOfInspection?.ToString("dd-MMM-yyyy", CultureInfo.InvariantCulture)?.ToUpper() ?? "-",
-                    "PLACE OF INSPECTION",
-                    doc.InspectionDetails?.InspectionLocation?.ToUpper() ?? "-");
+                    row.RelativeItem(weight)
+                       .BorderLeft(divider ? 1 : 0).BorderColor("#E5E7EB")
+                       .PaddingLeft(divider ? 10 : 0)
+                       .Element(c => StripField(c, label, value));
+                }
+                Cell(1.5f, "CLIENT",              doc.Stakeholder?.Name?.ToUpper() ?? "-", false);
+                Cell(0.8f, "BRANCH",              stripPlace, true);
+                Cell(0.85f, "DATE OF INSPECTION",
+                     doc.InspectionDetails?.DateOfInspection?.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture) ?? "-", true);
+                Cell(0.95f, "PLACE OF INSPECTION", stripPlace, true);
             });
 
-            main.Item().PaddingVertical(2);
+            main.Item().PaddingVertical(1);
 
             DrawSectionTitle(main.Item(), "ASSET IDENTITY",
                 @"<path d=""M18.92 6.01C18.72 5.42 18.16 5 17.5 5h-11c-.66 0-1.21.42-1.42 1.01L3 12v8c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h12v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-8l-2.08-5.99zM6.5 16c-.83 0-1.5-.67-1.5-1.5S5.67 13 6.5 13s1.5.67 1.5 1.5S7.33 16 6.5 16zm11 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zM5 11l1.5-4.5h11L19 11H5z""/>",
-                svgFill: true);
+                svgFill: true, pad: 3f);
 
-            _assetRowIndex = 0;
-            main.Item().Border(1).BorderColor("#EEF2F6").Table(table =>
+            // Two columns of label-over-value, not four columns of label | value.
+            // The mockup's layout, and it is also what retires the column-width juggling
+            // the old table needed: each field now owns half the width instead of a
+            // quarter, so a 29-character owner name has room without borrowing it from
+            // the column beside it.
+            main.Item().Border(1).BorderColor("#EEF2F6").Padding(5).Table(table =>
             {
                 table.ColumnsDefinition(cd =>
                 {
-                    // 3/6, not 4/5. The labels here are short ("OWNER", "COLOUR") and were
-                    // sitting in a 123pt column while the values were cramped into 154pt --
-                    // enough that an ordinary name like GOTTUMUKKALA SREENIVASA VARMA wrapped
-                    // onto a second line, on both the OWNER and APPLICANT rows. That is 21.6pt
-                    // the cover has nowhere to put: it overflowed and stranded the sign-off's
-                    // last line, "License No", alone on a page of its own.
-                    // Asymmetric on purpose. Only the LEFT pair carries long values (owner
-                    // and applicant names); the right pair holds DIESEL / MANUAL / WHITE and
-                    // needs its label width for "OWNERSHIP NUMBER", which wraps at 3 units.
-                    cd.RelativeColumn(3); cd.RelativeColumn(6);
-                    cd.RelativeColumn(4); cd.RelativeColumn(5);
+                    cd.RelativeColumn(); cd.ConstantColumn(16); cd.RelativeColumn();
                 });
-                AddAssetRow(table, "OWNER",            doc.VehicleDetails?.OwnerName?.ToUpper() ?? "-",      "FUEL TYPE",         doc.VehicleDetails?.Fuel?.ToUpper() ?? "-");
-                AddAssetRow(table, "APPLICANT",        doc.Stakeholder?.Applicant?.Name?.ToUpper() ?? "-",   "TRANSMISSION",      SafeFormat(doc.InspectionDetails?.TransmissionType?.ToUpper()));
-                AddAssetRow(table, "CHASSIS NUMBER",   doc.VehicleDetails?.ChassisNumber?.ToUpper() ?? "-",  "COLOUR",            doc.VehicleDetails?.Colour?.ToUpper() ?? "-");
-                AddAssetRow(table, "ENGINE NUMBER",    doc.VehicleDetails?.EngineNumber?.ToUpper() ?? "-",   "ODO METER",         doc.VehicleDetails?.Odometer?.ToString() ?? doc.InspectionDetails?.Odometer?.ToString() ?? "-");
-                AddAssetRow(table, "MANUFACTURE YEAR",
-                    ResolveMfgYear(doc.VehicleDetails),
-                    "VEHICLE TYPE",      doc.VehicleDetails?.ClassOfVehicle?.ToUpper() ?? "-");
-                AddAssetRow(table, "REGISTERED ON",
-                    doc.VehicleDetails?.DateOfRegistration?.ToString("dd-MMM-yyyy", CultureInfo.InvariantCulture)?.ToUpper() ?? "-",
-                    "OWNERSHIP NUMBER",  doc.VehicleDetails?.OwnerSerialNo?.ToString() ?? "1");
+
+                var vd = doc.VehicleDetails;
+                var pairs = new (string L, string? V, string R, string? RV)[]
+                {
+                    ("OWNER",            vd?.OwnerName,
+                     "APPLICANT",        doc.Stakeholder?.Applicant?.Name),
+                    ("CHASSIS NUMBER",   vd?.ChassisNumber,
+                     "ENGINE NUMBER",    vd?.EngineNumber),
+                    ("MANUFACTURE YEAR", ResolveMfgYear(vd),
+                     "REGISTERED ON",    vd?.DateOfRegistration?.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)),
+                    ("FUEL TYPE",        vd?.Fuel,
+                     "TRANSMISSION",     doc.InspectionDetails?.TransmissionType),
+                    ("COLOUR",           vd?.Colour,
+                     "ODO METER",        vd?.Odometer?.ToString() ?? doc.InspectionDetails?.Odometer?.ToString()),
+                    ("VEHICLE TYPE",     vd?.ClassOfVehicle,
+                     "OWNERSHIP NUMBER", vd?.OwnerSerialNo?.ToString() ?? "1"),
+                };
+
+                for (int i = 0; i < pairs.Length; i++)
+                {
+                    var (l, v, r, rv) = pairs[i];
+                    bool last = i == pairs.Length - 1;
+                    // Rule between rows, not under the last one, so the list does not
+                    // print a second line hard against the card's own border.
+                    void Slot(string label, string? value) =>
+                        table.Cell().BorderBottom(last ? 0 : 1).BorderColor("#F1F5F9")
+                             .PaddingVertical(2)
+                             .Element(c => AssetField(c, label, value));
+
+                    Slot(l, v);
+                    table.Cell();
+                    Slot(r, rv);
+                }
             });
 
-            main.Item().PaddingVertical(3);
+            main.Item().PaddingVertical(1);
 
-            main.Item().Row(outerRow =>
+            DrawSectionTitle(main.Item(), "ESTIMATED MARKET VALUE",
+                @"<circle cx=""12"" cy=""12"" r=""9""/><path d=""M12 7v10M9.5 9.2h5M9.5 11.4h5M13.2 9.2c1 0 1.6.8 1.6 1.7s-.7 1.7-1.8 1.7h-3l3.8 4.4""/>",
+                svgFill: false, pad: 3f);
+
+            main.Item().Row(valueRow =>
             {
-                outerRow.RelativeItem().Column(col =>
+                // The value card, which used to sit under the gauge at the top right.
+                valueRow.RelativeItem(7).Layers(layers =>
                 {
-                    DrawSectionTitle(col.Item(), "CONDITION VERDICT",
-                        @"<path d=""M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z""/>
-                          <path d=""M9 12l2 2 4-4""/>",
-                        svgFill: false);
-
-                    col.Item().Table(table =>
+                    layers.Layer().Svg(size => {
+                        string w = size.Width.ToString("F1", CultureInfo.InvariantCulture);
+                        string h = size.Height.ToString("F1", CultureInfo.InvariantCulture);
+                        return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""12"" fill=""{BrandTeal}""/></svg>";
+                    });
+                    layers.PrimaryLayer().PaddingVertical(7).PaddingHorizontal(13).Row(r =>
                     {
-                        table.ColumnsDefinition(cd =>
+                        r.RelativeItem().AlignMiddle().Column(c =>
                         {
-                            cd.RelativeColumn(); cd.ConstantColumn(6); cd.RelativeColumn();
+                            c.Item().Text("ESTIMATED MARKET VALUE")
+                                .FontSize(8).Bold().FontColor(Colors.White).LetterSpacing(0.04f);
+                            c.Item().PaddingTop(4)
+                                .Text($"\u20b9 {FormatIndianCurrency(doc.QualityControl?.ValuationAmount ?? 0)}")
+                                .FontSize(17).ExtraBold().FontColor(Colors.White);
+                            c.Item().PaddingTop(3).Text("Calculated based on current market trends")
+                                .FontSize(7).Italic().FontColor("#D6F0E2");
                         });
-
-                        void VerdictCell(string lbl, string? val)
+                        r.AutoItem().AlignMiddle().Width(30).Height(30).Layers(b =>
                         {
-                            var verdict = MapVerdict(val);
-                            string badgeBg, badgeFg;
-                            if (verdict is "GOOD" or "YES")              { badgeBg = "#D1FAE5"; badgeFg = "#065F46"; }
-                            else if (verdict == "AVERAGE")               { badgeBg = "#FEF3C7"; badgeFg = "#92400E"; }
-                            else if (verdict is "POOR" or "BAD" or "NO" or "DAMAGED" or "MISSING")
-                                                                         { badgeBg = "#FEE2E2"; badgeFg = "#991B1B"; }
-                            else                                         { badgeBg = "#F1F5F9"; badgeFg = "#64748B"; }
-
-                            table.Cell().PaddingVertical(3).Layers(cell =>
-                            {
-                                cell.Layer().Svg(s => {
-                                    string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
-                                    string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                                    return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""4"" fill=""#F8FAFC"" stroke=""#EEF2F6"" stroke-width=""1""/></svg>";
-                                });
-                                cell.PrimaryLayer().PaddingHorizontal(6).PaddingVertical(4).Row(r =>
-                                {
-                                    r.RelativeItem().AlignMiddle()
-                                        .Text(lbl).FontSize(9).Bold().FontColor(LabelSlate);
-                                    r.AutoItem().AlignMiddle().Layers(badge =>
-                                    {
-                                        badge.Layer().Svg(s => {
-                                            string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
-                                            string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""4"" fill=""{badgeBg}""/></svg>";
-                                        });
-                                        badge.PrimaryLayer().PaddingVertical(2).PaddingHorizontal(6)
-                                            .Text(verdict).FontSize(8).Bold().FontColor(badgeFg);
-                                    });
-                                });
-                            });
-                        }
-
-                        var coverVerdicts = ResolveCoverVerdicts(doc);
-                        VerdictCell("CABIN",         coverVerdicts.Cabin);
-                        table.Cell(); // spacer column
-                        VerdictCell("ENGINE",        coverVerdicts.Engine);
-
-                        VerdictCell("LOAD BODY",     coverVerdicts.Body);
-                        table.Cell();
-                        VerdictCell("OTHER SYSTEMS", coverVerdicts.Other);
+                            b.Layer().Svg(_ =>
+                                @"<svg xmlns=""http://www.w3.org/2000/svg"" viewBox=""0 0 30 30""><circle cx=""15"" cy=""15"" r=""14"" fill=""#FFFFFF"" fill-opacity=""0.16""/></svg>");
+                            b.PrimaryLayer().AlignCenter().AlignMiddle()
+                                .Text("\u20b9").FontSize(13).ExtraBold().FontColor(Colors.White);
+                        });
                     });
                 });
 
-                outerRow.ConstantItem(12);
+                valueRow.ConstantItem(12);
 
-                outerRow.AutoItem().Column(linkCol =>
+                // Dedupe, blacklist and the two links, as one list of label/value rows
+                // rather than four free-standing pills.
+                valueRow.RelativeItem(5).Column(list =>
                 {
-                    var (dedupeLabel, dedupeBg, dedupeStroke, dedupeColor, dedupeIcon) = DedupeChip(doc);
+                    var dedupe = DedupeChip(doc);
+                    var black  = BlacklistChip(doc);
 
-                    linkCol.Item().PaddingBottom(5).Layers(layers =>
+                    void ListRow(string label, string value, string valueColor, bool last)
                     {
-                        layers.Layer().Svg(s => {
-                            string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
-                            string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""{dedupeBg}"" stroke=""{dedupeStroke}"" stroke-width=""1""/></svg>";
-                        });
-                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).Row(r =>
+                        list.Item().PaddingBottom(last ? 0 : 3).Layers(layers =>
                         {
-                            r.AutoItem().AlignMiddle().Width(10).Height(10)
-                                .Svg(_ => $@"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""{dedupeColor}"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""10""/>{dedupeIcon}</svg>");
-                            r.ConstantItem(6);
-                            r.AutoItem().AlignMiddle().Text(t => {
-                                t.Span("DEDUPE: ").FontSize(7).ExtraBold().FontColor(ValueDark);
-                                t.Span(dedupeLabel).FontSize(7).ExtraBold().FontColor(dedupeColor);
+                            layers.Layer().Svg(s2 => {
+                                string w = s2.Width.ToString("F1", CultureInfo.InvariantCulture);
+                                string h = s2.Height.ToString("F1", CultureInfo.InvariantCulture);
+                                return $@"<svg width=""{w}"" height=""{h}""><rect x=""0.5"" y=""0.5"" width=""{(s2.Width - 1).ToString("F1", CultureInfo.InvariantCulture)}"" height=""{(s2.Height - 1).ToString("F1", CultureInfo.InvariantCulture)}"" rx=""5"" fill=""#FFFFFF"" stroke=""#E5E7EB"" stroke-width=""1""/></svg>";
+                            });
+                            layers.PrimaryLayer().PaddingVertical(3.5f).PaddingHorizontal(10).Row(r =>
+                            {
+                                r.RelativeItem().AlignMiddle()
+                                    .Text(label).FontSize(8).ExtraBold().FontColor(ValueDark);
+                                r.AutoItem().AlignMiddle()
+                                    .Text(value).FontSize(8).ExtraBold().FontColor(valueColor);
                             });
                         });
-                    });
+                    }
 
-                    // Blacklist, stacked under dedupe. Two separate questions —
-                    // "has this vehicle been through here before" and "does VAHAN
-                    // report it stolen" — which shared one chip and one label until
-                    // they were untangled.
-                    var (blLabel, blBg, blStroke, blColor, blIcon) = BlacklistChip(doc);
+                    ListRow("DEDUPE",      dedupe.Label, dedupe.Color, false);
+                    ListRow("BLACKLIST",   black.Label,  black.Color,  false);
 
-                    linkCol.Item().PaddingBottom(5).Layers(layers =>
-                    {
-                        layers.Layer().Svg(s => {
-                            string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
-                            string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""{blBg}"" stroke=""{blStroke}"" stroke-width=""1""/></svg>";
-                        });
-                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).Row(r =>
-                        {
-                            r.AutoItem().AlignMiddle().Width(10).Height(10)
-                                .Svg(_ => $@"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""{blColor}"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""10""/>{blIcon}</svg>");
-                            r.ConstantItem(6);
-                            r.AutoItem().AlignMiddle().Text(t => {
-                                t.Span("BLACKLIST: ").FontSize(7).ExtraBold().FontColor(ValueDark);
-                                t.Span(blLabel).FontSize(7).ExtraBold().FontColor(blColor);
-                            });
-                        });
-                    });
-
-                    var videoContainer = linkCol.Item().PaddingBottom(5);
-                    string? videoUrl = null;
-                    if (doc.VideoUrls != null) doc.VideoUrls.TryGetValue("VehicleVideo", out videoUrl);
-                    if (!string.IsNullOrWhiteSpace(videoUrl)) videoContainer = videoContainer.Hyperlink(videoUrl);
-                    videoContainer.Layers(layers =>
-                    {
-                        layers.Layer().Svg(size => {
-                            string w = size.Width.ToString("F1", CultureInfo.InvariantCulture);
-                            string h = size.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""#EFF6FF"" stroke=""#BFDBFE"" stroke-width=""1""/></svg>";
-                        });
-                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).Row(r =>
-                        {
-                            r.AutoItem().Width(10).Height(10)
-                                .Svg(_ => @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1D4ED8"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M23 7l-7 5 7 5V7z""/><rect x=""1"" y=""5"" width=""15"" height=""14"" rx=""2""/></svg>");
-                            r.ConstantItem(6);
-                            r.AutoItem().AlignMiddle()
-                                .Text("VIDEO LINK").FontSize(8).ExtraBold().FontColor("#1D4ED8");
-                        });
-                    });
-
-                    // Opens the browser photo gallery uploaded next to the PDF; falls back to
-                    // the in-PDF gallery pages when blob storage is not configured.
+                    // The images row links to the browser gallery uploaded beside the PDF,
+                    // and reads NOT AVAILABLE when there is none -- the same behaviour as
+                    // the video row, deliberately, rather than the internal jump to this
+                    // report's own gallery pages that it used to fall back to.
+                    //
+                    // It was briefly wired to doc.ImagesUrl, which is a different field
+                    // and is not populated, so the row printed NOT AVAILABLE on every
+                    // report whether a gallery existed or not.
                     string? galleryUrl = (_blobContainer != null && !string.IsNullOrWhiteSpace(_blobBaseUrl))
                         ? $"{_blobBaseUrl.TrimEnd('/')}/{_blobContainer.Name}/{referenceNumber}-gallery.html"
                         : null;
-                    var imagesChip = galleryUrl != null
-                        ? linkCol.Item().Hyperlink(galleryUrl)
-                        : linkCol.Item().SectionLink("PhotoGalleryTarget");
-                    imagesChip.Layers(layers =>
+
+                    string? videoUrl = null;
+                    doc.VideoUrls?.TryGetValue("VehicleVideo", out videoUrl);
+
+                    void LinkRow(string label, Func<IContainer, IContainer>? link, string valueText, bool last)
                     {
-                        layers.Layer().Svg(size => {
-                            string w = size.Width.ToString("F1", CultureInfo.InvariantCulture);
-                            string h = size.Height.ToString("F1", CultureInfo.InvariantCulture);
-                            return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""6"" fill=""#EFF6FF"" stroke=""#BFDBFE"" stroke-width=""1""/></svg>";
-                        });
-                        layers.PrimaryLayer().PaddingVertical(5).PaddingHorizontal(10).Row(r =>
+                        var item = list.Item().PaddingBottom(last ? 0 : 3);
+                        if (link != null) item = link(item);
+                        item.Layers(layers =>
                         {
-                            r.AutoItem().Width(10).Height(10)
-                                .Svg(_ => @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1D4ED8"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z""/><circle cx=""12"" cy=""13"" r=""4""/></svg>");
-                            r.ConstantItem(6);
-                            r.AutoItem().AlignMiddle()
-                                .Text("IMAGES LINK").FontSize(8).ExtraBold().FontColor("#1D4ED8");
+                            layers.Layer().Svg(s2 => {
+                                string w = s2.Width.ToString("F1", CultureInfo.InvariantCulture);
+                                string h = s2.Height.ToString("F1", CultureInfo.InvariantCulture);
+                                return $@"<svg width=""{w}"" height=""{h}""><rect x=""0.5"" y=""0.5"" width=""{(s2.Width - 1).ToString("F1", CultureInfo.InvariantCulture)}"" height=""{(s2.Height - 1).ToString("F1", CultureInfo.InvariantCulture)}"" rx=""5"" fill=""#FFFFFF"" stroke=""#E5E7EB"" stroke-width=""1""/></svg>";
+                            });
+                            layers.PrimaryLayer().PaddingVertical(3.5f).PaddingHorizontal(10).Row(r =>
+                            {
+                                r.RelativeItem().AlignMiddle()
+                                    .Text(label).FontSize(8).ExtraBold().FontColor(ValueDark);
+                                r.AutoItem().AlignMiddle().Text(valueText).FontSize(8).ExtraBold()
+                                    .FontColor(link == null ? LabelSlate : "#1D4ED8");
+                            });
                         });
-                    });
+                    }
+
+                    LinkRow("VIDEO LINK",
+                        string.IsNullOrWhiteSpace(videoUrl) ? null : c => c.Hyperlink(videoUrl!),
+                        string.IsNullOrWhiteSpace(videoUrl) ? "NOT AVAILABLE" : "VIEW \u00bb", false);
+
+                    LinkRow("IMAGES LINK",
+                        string.IsNullOrWhiteSpace(galleryUrl) ? null : c => c.Hyperlink(galleryUrl!),
+                        string.IsNullOrWhiteSpace(galleryUrl) ? "NOT AVAILABLE" : "VIEW \u00bb", true);
                 });
             });
 
-            main.Item().PaddingVertical(5);
+            main.Item().PaddingVertical(3);
 
             main.Item().Row(row =>
             {
@@ -1337,9 +1423,9 @@ namespace Valuation.Api.Services
                     {
                         c.Item().Text("REMARKS")
                             .FontSize(8).ExtraBold().FontColor(LabelSlate).LetterSpacing(0.06f);
-                        c.Item().PaddingTop(6)
+                        c.Item().PaddingTop(4)
                             .Text($"\"{doc.QualityControl?.Remarks ?? "Vehicle found in good road worthy condition."}\"")
-                            .FontSize(8.5f).Italic().FontColor("#374151").LineHeight(1.5f);
+                            .FontSize(8.5f).Italic().FontColor("#374151").LineHeight(1.3f);
                     });
                 });
 
@@ -1352,12 +1438,12 @@ namespace Valuation.Api.Services
                         string h = size.Height.ToString("F1", CultureInfo.InvariantCulture);
                         return $@"<svg width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""12"" fill=""white"" stroke=""#E5E7EB"" stroke-width=""1.5""/></svg>";
                     });
-                    layers.PrimaryLayer().PaddingTop(8).PaddingBottom(8).Column(c =>
+                    layers.PrimaryLayer().PaddingTop(5).PaddingBottom(5).Column(c =>
                     {
                         if (qrCode.Length > 0)
                         {
                             var verifyUrl = $"https://prontofirebase.web.app/verify/{referenceNumber}";
-                            c.Item().AlignCenter().Width(44).Height(44).Hyperlink(verifyUrl).Image(qrCode).FitArea();
+                            c.Item().AlignCenter().Width(36).Height(36).Hyperlink(verifyUrl).Image(qrCode).FitArea();
                         }
                         c.Item().PaddingTop(4).AlignCenter()
                             .Text("VERIFY ONLINE").FontSize(6f).ExtraBold().FontColor(LabelSlate);
@@ -1406,13 +1492,18 @@ namespace Valuation.Api.Services
             });
         }
 
-        private void DrawSectionTitle(IContainer container, string title, string iconPathsSvg, bool svgFill)
+        /// <summary>
+        /// Section heading. <paramref name="pad"/> is the space above and below it: the
+        /// cover runs tighter than the Vahan page, which has room to spare.
+        /// </summary>
+        private void DrawSectionTitle(IContainer container, string title, string iconPathsSvg, bool svgFill,
+            float pad = 5f)
         {
             string strokeAttr = svgFill
                 ? $@"fill=""{BrandTeal}"" stroke=""none"""
                 : $@"fill=""none"" stroke=""{BrandTeal}"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""";
 
-            container.PaddingBottom(5).PaddingTop(5).Row(row => 
+            container.PaddingBottom(pad).PaddingTop(pad).Row(row => 
             {
                 row.AutoItem().AlignMiddle().Width(4).Height(20)
                     .Svg(_ => $@"<svg width=""4"" height=""20""><rect width=""4"" height=""20"" rx=""2"" fill=""{BrandTeal}""/></svg>");
@@ -1456,8 +1547,16 @@ namespace Valuation.Api.Services
                 AddVahanRow(col, i++, "VEHICLE CATEGORY",      vd?.CategoryCode,                 "SEATING CAPACITY",      $"{vd?.SeatingCapacity?.ToString() ?? "5"} SEATS");
                 AddVahanRow(col, i++, "VEHICLE CLASS",         vd?.ClassOfVehicle,               "FUEL TYPE",             vd?.Fuel);
                 AddVahanRow(col, i++, "BODY TYPE",             vd?.BodyType,                     "FUEL NORMS",            vd?.NormsType);
-                AddVahanRow(col, i++, "VEHICLE COLOR",         vd?.Colour,                       "NOC DETAILS",           "---");
-                AddVahanRow(col, i++, "REGISTERED AT RTO",     vd?.Rto,                          "CHALLAN DETAILS",       "---");
+                // NOC DETAILS and CHALLAN DETAILS sat here as permanent "---": neither has
+                // a source field in SurepassRcResponse. Replaced with two values that do,
+                // so the client's requested rows cost no extra height.
+                AddVahanRow(col, i++, "VEHICLE COLOR",         vd?.Colour,                       "RC STATUS",             ResolveRcStatus(vd));
+                // Was TAX VALID UPTO. Road tax now has its own status card below, where a
+                // life-time-tax vehicle can read LIFE TIME instead of a blank date, so this
+                // slot carries the PUC expiry -- mapped from VAHAN and previously unused.
+                AddVahanRow(col, i++, "REGISTERED AT RTO",     vd?.Rto,                          "PUC VALID UPTO",        FormatPucUpto(vd));
+                AddVahanAddressRow(col, i++, "PRESENT ADDRESS",   vd?.PresentAddress);
+                AddVahanAddressRow(col, i++, "PERMANENT ADDRESS", vd?.PermanentAddress);
             });
 
             main.Item().PaddingTop(14).PaddingBottom(10).Element(c => 
@@ -1469,9 +1568,16 @@ namespace Valuation.Api.Services
             bool hasLien = vd?.Hypothecation ?? false;
 
             var insStat = DocumentStatus(vd?.InsurancePolicyNo, vd?.InsuranceValidUpTo);
-            var insDetails = string.IsNullOrWhiteSpace(vd?.InsurancePolicyNo)
+            // The card is titled COMPREHENSIVE INSURANCE but never named the insurer,
+            // which is mapped from VAHAN and was simply not being read.
+            var insurer = vd?.Insurer?.Trim();
+            var insParts = new List<string>();
+            if (!string.IsNullOrWhiteSpace(insurer)) insParts.Add(insurer!);
+            insParts.Add(string.IsNullOrWhiteSpace(vd?.InsurancePolicyNo)
                 ? "Policy: ---"
-                : $"Policy: {vd!.InsurancePolicyNo}" + (vd.IDV != null ? $" | IDV: Rs. {vd.IDV?.ToString("N0")}" : "");
+                : $"Policy: {vd!.InsurancePolicyNo}");
+            if (vd?.IDV != null) insParts.Add($"IDV: Rs. {vd.IDV?.ToString("N0")}");
+            var insDetails = string.Join(" | ", insParts);
 
             var permitStat = DocumentStatus(vd?.PermitNo, vd?.PermitValidUpTo);
             var permitDetails = string.IsNullOrWhiteSpace(vd?.PermitNo)
@@ -1481,24 +1587,86 @@ namespace Valuation.Api.Services
             var fitStat = DocumentStatus(vd?.FitnessNo, vd?.FitnessValidTo);
             var fitDetails = string.IsNullOrWhiteSpace(vd?.FitnessNo) ? "" : $"Certificate: {vd!.FitnessNo}";
 
-            // Spacing between cards, not PaddingBottom on each one. A trailing 12pt on the
-            // LAST card is space nothing occupies, but QuestPDF still has to fit it: on a
-            // report whose RTO value wrapped, the final chassis card ended at 787pt with a
-            // limit of ~796 and the padding pushed the requirement to 799, so the whole card
-            // was moved to a page of its own and every page after it renumbered.
-            main.Item().Column(col =>
+            var taxStat = TaxStatus(vd);
+
+            // Two across. Stacked full-width, five document cards ran most of the page for
+            // a line of text each; paired, they take half the height and leave the page
+            // room for the chassis evidence beneath them.
+            //
+            // Spacing lives on the table, not as PaddingBottom on each card. A trailing
+            // 12pt on the LAST card is space nothing occupies, but QuestPDF still has to
+            // fit it: on a report whose RTO value wrapped, the final chassis card ended at
+            // 787pt against a ~796 limit and that padding pushed the requirement to 799,
+            // so the card moved to a page of its own and renumbered every page after it.
+            main.Item().Table(grid =>
+            {
+                grid.ColumnsDefinition(cd =>
+                {
+                    cd.RelativeColumn(); cd.ConstantColumn(12); cd.RelativeColumn();
+                });
+
+                var cards = new List<Action<IContainer>>
+                {
+                    c => AddRegulatoryCardSimple(c, "COMPREHENSIVE INSURANCE",
+                             insDetails, insStat.Status, insStat.Expiry, insStat.Warn),
+                    c => AddRegulatoryCardSimple(c, "HYPOTHECATION (STATUS)",
+                             hasLien ? "LIEN DETECTED" : "CLEAN / NO LIEN DETECTED",
+                             hasLien ? "LIEN" : "FREE OF LIEN",
+                             hasLien ? "" : "READY FOR TRANSFER", hasLien),
+                    c => AddRegulatoryCardSimple(c, "NATIONAL PERMIT",
+                             permitDetails, permitStat.Status, permitStat.Expiry, permitStat.Warn),
+                    c => AddRegulatoryCardSimple(c, "FITNESS CERTIFICATE",
+                             fitDetails, fitStat.Status, fitStat.Expiry, fitStat.Warn),
+                    c => AddRegulatoryCardSimple(c, "TAX VALIDITY",
+                             "Road tax / LTT status", taxStat.Status, taxStat.Expiry, taxStat.Warn),
+                };
+
+                for (int i = 0; i < cards.Count; i++)
+                {
+                    var draw = cards[i];
+                    // No ExtendVertical here: on a table cell it makes each card claim the
+                    // rest of the page, which paginates the section into four.
+                    grid.Cell().PaddingBottom(i < cards.Count - 2 ? 12 : 0)
+                        .Element(c => draw(c));
+                    if (i % 2 == 0) grid.Cell();   // the gap column
+                }
+                // Odd card count leaves the last slot empty rather than stretching a card
+                // across a width its one line of text cannot carry.
+                if (cards.Count % 2 != 0) { grid.Cell(); grid.Cell(); }
+            });
+
+            // Full width, both of them: these are wide strips of a chassis number, and at
+            // half width the digits stop being legible -- which is the only thing the
+            // reader is looking at them for.
+            main.Item().PaddingTop(12).Column(col =>
             {
                 col.Spacing(12);
-                AddRegulatoryCardSimple(col, "COMPREHENSIVE INSURANCE",
-                    insDetails, insStat.Status, insStat.Expiry, insStat.Warn);
-                AddRegulatoryCardSimple(col, "HYPOTHECATION (STATUS)",
-                    hasLien ? "LIEN DETECTED" : "CLEAN / NO LIEN DETECTED",
-                    hasLien ? "LIEN" : "FREE OF LIEN", hasLien ? "" : "READY FOR TRANSFER", hasLien);
-                AddRegulatoryCardSimple(col, "NATIONAL PERMIT", permitDetails, permitStat.Status, permitStat.Expiry, permitStat.Warn);
-                AddRegulatoryCardSimple(col, "FITNESS CERTIFICATE", fitDetails, fitStat.Status, fitStat.Expiry, fitStat.Warn);
                 AddRegulatoryCardWithPhoto(col, "CHASSIS VERIFICATION",  "VERIFIED", photos, "ChassisVerification");
                 AddRegulatoryCardWithPhoto(col, "CHASSIS STENCIL TRACE", "",         photos, "ChassisStencilTrace");
             });
+        }
+
+        /// <summary>
+        /// Road tax status for its own card.
+        ///
+        /// Separate from <see cref="DocumentStatus"/> because a life-time-tax vehicle has
+        /// no expiry at all: VAHAN answers "LTT" rather than a date, and forcing that
+        /// through the date path would read as a missing document on a vehicle whose tax
+        /// can never lapse.
+        /// </summary>
+        private static (string Status, string Expiry, bool Warn) TaxStatus(VehicleDetailsDto? vd)
+        {
+            var raw = vd?.TaxPaidUpto?.Trim();
+            if (!string.IsNullOrWhiteSpace(raw) && raw.Equals("LTT", StringComparison.OrdinalIgnoreCase))
+                return ("LIFE TIME", "", false);
+
+            if (vd?.TaxUpto is DateTime d)
+                return (d.Date >= DateTime.UtcNow.Date ? "ACTIVE" : "EXPIRED",
+                        $"EXP: {d.ToString("MMM yyyy", CultureInfo.InvariantCulture).ToUpper()}",
+                        d.Date < DateTime.UtcNow.Date);
+
+            if (!string.IsNullOrWhiteSpace(raw)) return ("ON RECORD", "", false);
+            return ("---", "EXP: ---", true);
         }
 
         // Derives card status from real document data: valid date → ACTIVE/EXPIRED,
@@ -1517,10 +1685,14 @@ namespace Valuation.Api.Services
                 : ("ON RECORD", "EXP: ---", false);
         }
 
-        private void AddRegulatoryCardSimple(ColumnDescriptor col,
+        private void AddRegulatoryCardSimple(IContainer cell,
             string title, string details, string status, string expiry, bool isWarning = false)
         {
-            col.Item().Layers(cardLayers =>
+            // 52pt clears a two-line detail string, which is what the insurance card
+            // carries once insurer, policy and IDV are all present. A floor rather than a
+            // fixed height: the pair on a row then matches, and a card that still needs
+            // more room grows instead of clipping.
+            cell.MinHeight(52).Layers(cardLayers =>
             {
                 cardLayers.Layer().Svg(s => {
                     string wStr = s.Width.ToString("F1", CultureInfo.InvariantCulture);
@@ -1530,12 +1702,12 @@ namespace Valuation.Api.Services
                               </svg>";
                 });
 
-                cardLayers.PrimaryLayer().PaddingVertical(10).PaddingHorizontal(14).Row(row =>
+                cardLayers.PrimaryLayer().PaddingVertical(9).PaddingHorizontal(10).Row(row =>
                 {
                     string strokeColor = isWarning ? "#F59E0B" : BrandTeal;
                     string fillColor   = isWarning ? "#FFFBEB" : "#F0FDF4";
 
-                    row.ConstantItem(36).AlignMiddle().AlignCenter().Width(16).Height(16)
+                    row.ConstantItem(26).AlignMiddle().AlignCenter().Width(16).Height(16)
                         .Svg(_ => $@"<svg xmlns=""http://www.w3.org/2000/svg"" viewBox=""0 0 24 24"">
                                         <circle cx=""12"" cy=""12"" r=""11"" fill=""{fillColor}"" stroke=""{strokeColor}"" stroke-width=""1""/>
                                         <polyline points=""7,12.5 10.5,16 17,8"" fill=""none"" stroke=""{strokeColor}"" stroke-width=""1.5""/>
@@ -1543,12 +1715,12 @@ namespace Valuation.Api.Services
 
                     row.RelativeItem().AlignMiddle().Column(c =>
                     {
-                        c.Item().Text(title).FontSize(10).Bold().FontColor(ValueDark);
+                        c.Item().Text(title).FontSize(9).Bold().FontColor(ValueDark);
                         if (!string.IsNullOrEmpty(details))
-                            c.Item().PaddingTop(3).Text(details).FontSize(8).FontColor(LabelSlate);
+                            c.Item().PaddingTop(2).Text(details).FontSize(7.5f).FontColor(LabelSlate);
                     });
 
-                    row.ConstantItem(120).AlignMiddle().AlignRight().Column(c =>
+                    row.AutoItem().AlignMiddle().AlignRight().PaddingLeft(6).Column(c =>
                     {
                         if (!string.IsNullOrEmpty(status) && status != "---")
                         {
@@ -1635,8 +1807,28 @@ namespace Valuation.Api.Services
         // Every field is scored. Where an item does not apply to the vehicle the
         // inspector answers N/A, which MapVerdict excludes from the average — that
         // is the lever for "not a defect", rather than exempting field names here.
-        private record FieldDef(string Label, string Key);
+        /// <summary>
+        /// One row on a system card. <paramref name="Scored"/> false means the value is
+        /// printed but excluded from the card's score — mirrors `scored` on
+        /// InspectionField in the portal's inspection-field-registry.ts, which must be
+        /// changed in the same commit or screen and report will disagree.
+        /// </summary>
+        private record FieldDef(string Label, string Key, bool Scored = true);
         private record SectionDef(string Name, FieldDef[] Fields);
+
+        /// <summary>
+        /// Sections printed but excluded from scoring, mirroring `scored: false` on
+        /// InspectionSection in the portal registry.
+        ///
+        /// OTHER SYSTEMS lists accessories and fitments — air conditioning, crash guards,
+        /// a load carrier. Whether one was ever fitted is a fact about how the vehicle was
+        /// built, not a judgement of its condition, so a vehicle that never had a crash
+        /// guard should not score below one that does.
+        /// </summary>
+        private static readonly HashSet<string> UnscoredSections =
+            new(StringComparer.OrdinalIgnoreCase) { "OTHER SYSTEMS" };
+
+        private static bool IsScored(SectionDef sec) => !UnscoredSections.Contains(sec.Name);
 
         private static readonly Dictionary<string, SectionDef[]> PdfFieldRegistry = new()
         {
@@ -1659,7 +1851,7 @@ namespace Valuation.Api.Services
                 }),
                 new("BRAKES", new FieldDef[] {
                     new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs"),
+                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs", Scored: false),
                 }),
                 new("ELECTRICAL SYSTEM", new FieldDef[] {
                     new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
@@ -1707,7 +1899,7 @@ namespace Valuation.Api.Services
                 }),
                 new("BRAKES", new FieldDef[] {
                     new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs"),
+                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs", Scored: false),
                 }),
                 new("ELECTRICAL SYSTEM", new FieldDef[] {
                     new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
@@ -1759,7 +1951,7 @@ namespace Valuation.Api.Services
                 }),
                 new("BRAKES", new FieldDef[] {
                     new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("BRAKE LEVERS / FLUID","brakeLeversFluid"), new("ABS","abs"),
+                    new("BRAKE LEVERS / FLUID","brakeLeversFluid"), new("ABS","abs", Scored: false),
                 }),
                 new("ELECTRICAL SYSTEM", new FieldDef[] {
                     new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
@@ -1808,7 +2000,7 @@ namespace Valuation.Api.Services
                 }),
                 new("BRAKES", new FieldDef[] {
                     new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs"),
+                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs", Scored: false),
                 }),
                 new("ELECTRICAL SYSTEM", new FieldDef[] {
                     new("LIGHTS","headLights"), new("BATTERY","batteryCondition"),
@@ -1907,7 +2099,7 @@ namespace Valuation.Api.Services
                 }),
                 new("BRAKES", new FieldDef[] {
                     new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs"),
+                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs", Scored: false),
                 }),
                 new("ELECTRICAL SYSTEM", new FieldDef[] {
                     new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
@@ -2076,12 +2268,16 @@ namespace Valuation.Api.Services
             Dictionary<string, string?> BuildItems(SectionDef sec) =>
                 sec.Fields.ToDictionary(f => f.Label, f => GetInsValue(ins, f.Key));
 
+            // Every field is listed; only the scored ones move the number.
+            Dictionary<string, string?>? BuildScoreItems(SectionDef sec) =>
+                IsScored(sec) ? ScorableItems(sec, ins) : null;
+
             main.Item().Row(row =>
             {
                 row.RelativeItem().Column(col =>
                 {
                     foreach (var sec in leftSections)
-                        col.Item().Element(c => DrawSystemCard(c, GetSectionIcon(sec.Name), sec.Name, BuildItems(sec)));
+                        col.Item().Element(c => DrawSystemCard(c, GetSectionIcon(sec.Name), sec.Name, BuildItems(sec), BuildScoreItems(sec)));
                 });
 
                 row.ConstantItem(8);
@@ -2089,20 +2285,27 @@ namespace Valuation.Api.Services
                 row.RelativeItem().Column(col =>
                 {
                     foreach (var sec in rightSections)
-                        col.Item().Element(c => DrawSystemCard(c, GetSectionIcon(sec.Name), sec.Name, BuildItems(sec)));
+                        col.Item().Element(c => DrawSystemCard(c, GetSectionIcon(sec.Name), sec.Name, BuildItems(sec), BuildScoreItems(sec)));
                 });
             });
 
             // OTHER SYSTEMS spans full width with fields in 2 columns
             main.Item().Element(c => DrawSystemCard(c, SVGIcons.Other, otherSection.Name,
-                BuildItems(otherSection), twoColumns: true));
+                BuildItems(otherSection), BuildScoreItems(otherSection), twoColumns: true));
         }
 
+        /// <summary>
+        /// One system card. <paramref name="scoreItems"/> is the subset of
+        /// <paramref name="items"/> that counts toward the score; pass null for a section
+        /// that is not scored at all, and the badge says so instead of printing a figure.
+        /// </summary>
         private void DrawSystemCard(IContainer container, string iconSvg, string title,
-            Dictionary<string, string?> items, bool twoColumns = false)
+            Dictionary<string, string?> items, Dictionary<string, string?>? scoreItems,
+            bool twoColumns = false)
         {
-            var score = CalculateSystemScore(items);
-            var (scoreStr, _) = GetScoreDisplayFromDouble(score);
+            var scoreStr = scoreItems is null
+                ? "NOT SCORED"
+                : $"SCORE: {GetScoreDisplayFromDouble(CalculateSystemScore(scoreItems)).Score}";
 
             container.PaddingBottom(8).Layers(layers =>
             {
@@ -2131,7 +2334,7 @@ namespace Valuation.Api.Services
                                 return $@"<svg xmlns=""http://www.w3.org/2000/svg"" width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""7"" fill=""{ValueDark}""/></svg>";
                             });
                             badgeLayers.PrimaryLayer().PaddingHorizontal(6).AlignCenter().AlignMiddle()
-                                .Text($"SCORE: {scoreStr}").FontColor(Colors.White).FontSize(7f).Bold();
+                                .Text(scoreStr).FontColor(Colors.White).FontSize(7f).Bold();
                         });
                     });
 
@@ -2198,6 +2401,159 @@ namespace Valuation.Api.Services
             public const string Cooling      = @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1E293B"" stroke-width=""2""><path d=""M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z""/></svg>";
             public const string Suspension   = @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1E293B"" stroke-width=""2""><path d=""M8 4l4-2 4 2M8 20l4 2 4-2M12 2v20m-4-6h8m-8-8h8""/></svg>";
             public const string Other        = @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1E293B"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""9""/><path d=""M12 8v8m-4-4h8""/></svg>";
+        }
+
+        /// <summary>
+        /// Row glyphs, taken from Lucide (ISC licence) at their native 24x24 geometry --
+        /// the same set the report mockup uses, so these are the upstream paths rather
+        /// than a redrawing of a screenshot.
+        ///
+        /// Inner markup only: the stroke colour is the brand's, which is not known until
+        /// a document is composing, so these cannot be whole-SVG constants like
+        /// <see cref="SVGIcons"/>. Lucide art fills roughly 2..22 of the viewBox, so the
+        /// chip supplies the margin -- see LabelIconPad.
+        /// </summary>
+        private static class RowIcons
+        {
+            // lucide/user-round
+            public const string Owner        = @"<circle cx=""12"" cy=""8"" r=""5""/><path d=""M20 21a8 8 0 0 0-16 0""/>";
+            // lucide/user-round-check
+            public const string Applicant    = @"<path d=""M2 21a8 8 0 0 1 13.292-6""/><circle cx=""10"" cy=""8"" r=""5""/><path d=""m16 19 2 2 4-4""/>";
+            // lucide/shield-check
+            public const string Chassis      = @"<path d=""M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z""/><path d=""m9 12 2 2 4-4""/>";
+            // lucide/cog
+            public const string Engine       = @"<path d=""M11 10.27 7 3.34""/><path d=""m11 13.73-4 6.93""/><path d=""M12 22v-2""/><path d=""M12 2v2""/><path d=""M14 12h8""/><path d=""m17 20.66-1-1.73""/><path d=""m17 3.34-1 1.73""/><path d=""M2 12h2""/><path d=""m20.66 17-1.73-1""/><path d=""m20.66 7-1.73 1""/><path d=""m3.34 17 1.73-1""/><path d=""m3.34 7 1.73 1""/><circle cx=""12"" cy=""12"" r=""2""/><circle cx=""12"" cy=""12"" r=""8""/>";
+            // lucide/calendar
+            public const string MfgYear      = @"<path d=""M8 2v3""/><path d=""M16 2v3""/><rect x=""3"" y=""3"" width=""18"" height=""18"" rx=""2""/><path d=""M3 9h18""/>";
+            // lucide/calendar-check
+            public const string Registered   = @"<path d=""M8 2v3""/><path d=""M16 2v3""/><rect x=""3"" y=""3"" width=""18"" height=""18"" rx=""2""/><path d=""M3 9h18""/><path d=""m9 15 2 2 4-4""/>";
+            // lucide/fuel
+            public const string Fuel         = @"<path d=""M14 13h2a2 2 0 0 1 2 2v2a2 2 0 0 0 4 0v-6.998a2 2 0 0 0-.59-1.42L18 5""/><path d=""M14 21V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v16""/><path d=""M2 21h13""/><path d=""M3 9h11""/>";
+            // tabler/manual-gearbox (MIT) -- the shift pattern, not Lucide's sliders, which
+            // read as "settings" rather than as a gearbox. Tabler draws on the same 24x24
+            // grid at stroke 2, so it sits beside the Lucide glyphs without adjustment.
+            public const string Transmission = @"<path d=""M3 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0""/><path d=""M10 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0""/><path d=""M17 6a2 2 0 1 0 4 0a2 2 0 1 0 -4 0""/><path d=""M3 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0""/><path d=""M10 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0""/><path d=""M5 8l0 8""/><path d=""M12 8l0 8""/><path d=""M19 8v2a2 2 0 0 1 -2 2h-12""/>";
+            // lucide/palette. Its four dots are r=.5 filled; stroked at r=.4 they read the
+            // same at this size and need no separate fill colour threaded through.
+            public const string Colour       = @"<path d=""M12 22a1 1 0 0 1 0-20 10 9 0 0 1 10 9 5 5 0 0 1-5 5h-2.25a1.75 1.75 0 0 0-1.4 2.8l.3.4a1.75 1.75 0 0 1-1.4 2.8z""/><circle cx=""13.5"" cy=""6.5"" r="".4""/><circle cx=""17.5"" cy=""10.5"" r="".4""/><circle cx=""6.5"" cy=""12.5"" r="".4""/><circle cx=""8.5"" cy=""7.5"" r="".4""/>";
+            // lucide/gauge
+            public const string Odometer     = @"<path d=""m12 14 4-4""/><path d=""M3.34 19a10 10 0 1 1 17.32 0""/>";
+            // lucide/car
+            public const string VehicleType  = @"<path d=""M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2""/><circle cx=""7"" cy=""17"" r=""2""/><path d=""M9 17h6""/><circle cx=""17"" cy=""17"" r=""2""/>";
+            // lucide/award
+            public const string Ownership    = @"<path d=""m15.477 12.89 1.515 8.526a.5.5 0 0 1-.81.47l-3.58-2.687a1 1 0 0 0-1.197 0l-3.586 2.686a.5.5 0 0 1-.81-.469l1.514-8.526""/><circle cx=""12"" cy=""8"" r=""6""/>";
+            // lucide/building
+            public const string Building     = @"<path d=""M12 10h.01""/><path d=""M12 14h.01""/><path d=""M12 6h.01""/><path d=""M16 10h.01""/><path d=""M16 14h.01""/><path d=""M16 6h.01""/><path d=""M8 10h.01""/><path d=""M8 14h.01""/><path d=""M8 6h.01""/><path d=""M9 22v-3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3""/><rect x=""4"" y=""2"" width=""16"" height=""20"" rx=""2""/>";
+            // lucide/map-pin
+            public const string Pin          = @"<path d=""M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0""/><circle cx=""12"" cy=""10"" r=""3""/>";
+
+            /// <summary>Neutral mark for a label with no entry in <see cref="LabelIcons"/>.</summary>
+            public const string Field        = @"<path d=""M4 6h16M4 12h16M4 18h10""/>";
+        }
+
+        /// <summary>
+        /// Label to glyph. A label with no entry falls back to a neutral mark rather than
+        /// to nothing: an iconless row would pull its text left of every neighbour and
+        /// break the column, which is worse than a generic mark.
+        ///
+        /// BRANCH and PLACE OF INSPECTION share a pin, and DATE OF INSPECTION reuses the
+        /// same calendar as MANUFACTURE YEAR.
+        /// </summary>
+        private static readonly Dictionary<string, string> LabelIcons =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["CLIENT"]              = RowIcons.Building,
+                ["BRANCH"]              = RowIcons.Pin,
+                ["DATE OF INSPECTION"]  = RowIcons.MfgYear,
+                ["PLACE OF INSPECTION"] = RowIcons.Pin,
+
+                ["OWNER"]               = RowIcons.Owner,
+                ["APPLICANT"]           = RowIcons.Applicant,
+                ["CHASSIS NUMBER"]      = RowIcons.Chassis,
+                ["ENGINE NUMBER"]       = RowIcons.Engine,
+                ["MANUFACTURE YEAR"]    = RowIcons.MfgYear,
+                ["REGISTERED ON"]       = RowIcons.Registered,
+                ["FUEL TYPE"]           = RowIcons.Fuel,
+                ["TRANSMISSION"]        = RowIcons.Transmission,
+                ["COLOUR"]              = RowIcons.Colour,
+                ["ODO METER"]           = RowIcons.Odometer,
+                ["VEHICLE TYPE"]        = RowIcons.VehicleType,
+                ["OWNERSHIP NUMBER"]    = RowIcons.Ownership,
+            };
+
+        private const float LabelIconBox = 15f;
+        // Lucide art runs to the edge of its viewBox, so the inset is ours to supply;
+        // at 2.2 on a 15pt chip the glyph lands at the proportion the mockup uses.
+        private const float LabelIconPad = 2.2f;
+        // Native Lucide weight. Scaled into the drawn area this lands at ~0.88pt, which
+        // is the stroke the mockup's own icons carry.
+        private const float IconStroke   = 2f;
+
+        /// <summary>Brand-stroked SVG for one row glyph.</summary>
+        private static string RowGlyph(string label)
+        {
+            var body = LabelIcons.TryGetValue(label, out var found) ? found : RowIcons.Field;
+            return $@"<svg xmlns=""http://www.w3.org/2000/svg"" viewBox=""0 0 24 24"" fill=""none"" stroke=""{BrandTeal}"" stroke-width=""{IconStroke.ToString("F1", CultureInfo.InvariantCulture)}"" stroke-linecap=""round"" stroke-linejoin=""round"">{body}</svg>";
+        }
+
+        /// <summary>Tinted chip with the row's glyph centred in it.</summary>
+        private void IconChip(IContainer cell, string label, float box)
+        {
+            var glyph = RowGlyph(label);
+            cell.Width(box).Height(box).Layers(l =>
+            {
+                l.Layer().Svg(s =>
+                {
+                    string w = s.Width.ToString("F1", CultureInfo.InvariantCulture);
+                    string h = s.Height.ToString("F1", CultureInfo.InvariantCulture);
+                    string r = (box / 3.2f).ToString("F1", CultureInfo.InvariantCulture);
+                    return $@"<svg xmlns=""http://www.w3.org/2000/svg"" width=""{w}"" height=""{h}""><rect width=""{w}"" height=""{h}"" rx=""{r}"" fill=""{Theme.TintBg}""/></svg>";
+                });
+                l.PrimaryLayer().Padding(box * LabelIconPad / LabelIconBox).Svg(_ => glyph);
+            });
+        }
+
+        /// <summary>
+        /// One ASSET IDENTITY field: icon chip on the left, label over value on the right.
+        ///
+        /// Replaces the old four-column table, where the label sat in its own column and
+        /// the value was right-aligned in the next. Stacking them halves the number of
+        /// columns, which is what buys a 29-character owner name room to sit on one line
+        /// without the column juggling that layout needed.
+        /// </summary>
+        private void AssetField(IContainer cell, string label, string? value)
+        {
+            cell.Row(row =>
+            {
+                row.AutoItem().AlignMiddle().Element(c => IconChip(c, label, LabelIconBox));
+                row.ConstantItem(7);
+                row.RelativeItem().AlignMiddle().Column(c =>
+                {
+                    c.Item().Text(label).FontSize(7).Bold().FontColor(LabelSlate).LetterSpacing(0.03f);
+                    c.Item().PaddingTop(1)
+                        .Text(SafeFormat(value?.ToUpper())).FontSize(9).ExtraBold().FontColor(ValueDark);
+                });
+            });
+        }
+
+        /// <summary>
+        /// One client-strip cell. Same shape as <see cref="AssetField"/> on a smaller
+        /// chip: the strip splits one row four ways, so it has a fraction of the width
+        /// an asset row gets.
+        /// </summary>
+        private void StripField(IContainer cell, string label, string? value)
+        {
+            cell.Row(row =>
+            {
+                row.AutoItem().AlignMiddle().Element(c => IconChip(c, label, 13f));
+                row.ConstantItem(5);
+                row.RelativeItem().AlignMiddle().Column(c =>
+                {
+                    c.Item().Text(label).FontSize(7).Bold().FontColor(LabelSlate).LetterSpacing(0.03f);
+                    c.Item().PaddingTop(1)
+                        .Text(SafeFormat(value?.ToUpper())).FontSize(9).ExtraBold().FontColor(ValueDark);
+                });
+            });
         }
 
         // ──────────────────────────────────────────────
@@ -2516,32 +2872,74 @@ show(0);
         // Table Cell Helpers
         // ──────────────────────────────────────────────
 
-        private static int _assetRowIndex = 0;
-        private void AddAssetRow(TableDescriptor table,
-            string label1, string? value1, string label2, string? value2)
-        {
-            bool even = _assetRowIndex % 2 == 0;
-            string rowBg = even ? "#FFFFFF" : "#FCFDFE";
-            _assetRowIndex++;
 
-            table.Cell().Background(rowBg).BorderRight(1).BorderBottom(1).BorderColor("#F1F5F9")
-                .PaddingVertical(5f).PaddingLeft(8).AlignLeft()
-                .Text(label1).FontSize(8).Bold().FontColor(LabelSlate);
-            table.Cell().Background(rowBg).BorderRight(1).BorderBottom(1).BorderColor("#F1F5F9")
-                .PaddingVertical(5f).PaddingRight(12).AlignRight()
-                .Text(SafeFormat(value1?.ToUpper())).FontSize(9).ExtraBold().FontColor(ValueDark);
-            table.Cell().Background(rowBg).BorderRight(1).BorderBottom(1).BorderColor("#F1F5F9")
-                .PaddingVertical(5f).PaddingLeft(12).AlignLeft()
-                .Text(label2).FontSize(8).Bold().FontColor(LabelSlate);
-            table.Cell().Background(rowBg).BorderBottom(1).BorderColor("#F1F5F9")
-                .PaddingVertical(5f).PaddingRight(8).AlignRight()
-                .Text(SafeFormat(value2?.ToUpper())).FontSize(9).ExtraBold().FontColor(ValueDark);
+        /// <summary>
+        /// A single label/value row spanning the full width.
+        ///
+        /// An Indian postal address is 80-120 characters and would wrap to three or four
+        /// lines inside AddVahanRow's right-aligned quarter-width column — which is
+        /// exactly the overflow that once renumbered every page after this one. Left
+        /// aligned, given the whole width, and hard-capped so a pathological VAHAN string
+        /// cannot blow the page budget however long it is.
+        /// </summary>
+        private void AddVahanAddressRow(ColumnDescriptor col, int idx, string label, string? value)
+        {
+            const int MaxChars = 110;
+            var text = (value ?? "").Trim();
+            if (text.Length > MaxChars) text = text[..(MaxChars - 1)].TrimEnd(',', ' ') + "\u2026";
+
+            string bg = idx % 2 == 0 ? "#FFFFFF" : "#F8FAFC";
+            col.Item().Background(bg).BorderBottom(1).BorderColor("#F1F5F9")
+                .PaddingVertical(4).PaddingHorizontal(10).Row(row =>
+            {
+                row.RelativeItem(2).AlignMiddle().Text(label.ToUpper()).FontSize(8).FontColor(LabelSlate);
+                row.RelativeItem(8).AlignMiddle().AlignLeft()
+                    .Text(text.Length == 0 ? "---" : text.ToUpper()).FontSize(8).Bold().FontColor(ValueDark);
+            });
+        }
+
+        /// <summary>
+        /// RC status as the report should print it.
+        ///
+        /// Prefers the text VAHAN returned; falls back to the bool for the whole back
+        /// catalogue, where RcStatusText is null because it was never mapped. Never
+        /// renders the bool directly — bool.ToString() is "True".
+        /// </summary>
+        private static string? ResolveRcStatus(VehicleDetailsDto? vd)
+        {
+            var text = vd?.RcStatusText?.Trim();
+            if (!string.IsNullOrWhiteSpace(text)) return text;
+            return vd?.RcStatus switch { true => "ACTIVE", false => "INACTIVE", _ => null };
+        }
+
+        /// <summary>
+        /// Road tax validity: the parsed date where there is one, otherwise the raw token.
+        ///
+        /// TaxPaidUpto is a string because VAHAN answers "LTT" for a life-time-tax
+        /// vehicle, which is not a date and must not be forced into one.
+        /// </summary>
+        /// <summary>Pollution certificate expiry, or null so the row prints "---".</summary>
+        private static string? FormatPucUpto(VehicleDetailsDto? vd) =>
+            vd?.PollutionCertificateUpto is DateTime d
+                ? d.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)
+                : null;
+
+        private static string? FormatTaxUpto(VehicleDetailsDto? vd)
+        {
+            if (vd?.TaxUpto is DateTime d) return d.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
+
+            var raw = vd?.TaxPaidUpto?.Trim();
+            if (string.IsNullOrWhiteSpace(raw)) return null;   // AddVahanRow prints "---"
+            return raw.Equals("LTT", StringComparison.OrdinalIgnoreCase) ? "LIFE TIME TAX" : raw;
         }
 
         private void AddVahanRow(ColumnDescriptor col, int idx,
             string l1, string? v1, string l2, string? v2)
         {
             string bg = idx % 2 == 0 ? "#FFFFFF" : "#F8FAFC";
+            // Back to 6pt. This was trimmed to 4 to pay for the two address rows, on an
+            // estimate of about 9pt of slack; measured, the page had 99pt, and pairing the
+            // document cards has since freed roughly another 100. The rows can breathe.
             col.Item().Background(bg).BorderBottom(1).BorderColor("#F1F5F9")
                 .PaddingVertical(6).PaddingHorizontal(10).Row(row =>
             {
@@ -2556,17 +2954,5 @@ show(0);
             });
         }
 
-        private void AddClientInfoRow(TableDescriptor table,
-            string label1, string? value1, string label2, string? value2)
-        {
-            table.Cell().PaddingVertical(5f).AlignLeft()
-                .Text(label1).FontSize(8).Bold().FontColor(LabelSlate);
-            table.Cell().PaddingVertical(5f).AlignRight().PaddingRight(12)
-                .Text(SafeFormat(value1?.ToUpper())).FontSize(9).ExtraBold().FontColor(ValueDark);
-            table.Cell().PaddingVertical(5f).PaddingLeft(12).AlignLeft()
-                .Text(label2).FontSize(8).Bold().FontColor(LabelSlate);
-            table.Cell().PaddingVertical(5f).AlignRight()
-                .Text(SafeFormat(value2?.ToUpper())).FontSize(9).ExtraBold().FontColor(ValueDark);
-        }
     }
 }

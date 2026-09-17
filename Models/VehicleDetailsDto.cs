@@ -1,4 +1,4 @@
-namespace Valuation.Api.Models
+﻿namespace Valuation.Api.Models
 {
     public class VehicleDetailsDto
     {
@@ -33,6 +33,18 @@ namespace Valuation.Api.Models
         public DateTime? FitnessValidTo { get; set; }
         public bool? BacklistStatus { get; set; }
         public bool? RcStatus { get; set; }
+
+        /// <summary>
+        /// The RC status VAHAN actually returned, e.g. "ACTIVE", "SUSPENDED", "NOC ISSUED".
+        ///
+        /// <see cref="RcStatus"/> is a bool the QC checklist reads and is hardcoded true;
+        /// printing it would render "TRUE". This carries the text so the report can state
+        /// what the registering authority said. Free text from VAHAN — print it, do not
+        /// branch on it. Must exist in BOTH copies of this DTO (Valuation.Api and
+        /// ProntoPDFGeneration): they are hand-synced, and if only one changes everything
+        /// still compiles while the report silently prints "---".
+        /// </summary>
+        public string? RcStatusText { get; set; }
         public string? StencilTraceUrl { get; set; }
         public string? ChassisNoPhotoUrl { get; set; }
         public int? Odometer { get; set; }
