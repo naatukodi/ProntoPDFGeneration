@@ -578,17 +578,23 @@ namespace Valuation.Api.Services
 
         /// <summary>
         /// Normalises an inspection value to one of GOOD / AVERAGE / POOR / DAMAGED /
-        /// MISSING / NO / NA. Mirrors CONDITION_OPTIONS in the portal's
+        /// MISSING / YES / NO / NA. Mirrors CONDITION_OPTIONS in the portal's
         /// inspection-field-registry.ts and conditionOptions in the app's
         /// inspection_field_registry.dart — keep the three in sync.
+        ///
+        /// YES prints as YES. It used to be folded into GOOD, which read wrongly once
+        /// the checklist asked yes/no questions (ENGINE STARTED: GOOD). It scores the
+        /// same as GOOD. true/false are the pre-2026-09 Engine Started / Vehicle Moved
+        /// answers, still raw in Cosmos for cases nobody has re-saved.
         /// </summary>
         private string MapVerdict(string? input)
         {
             if (string.IsNullOrWhiteSpace(input)) return "NA";
             var lower = input.ToLower().Trim();
-            if (lower is "true" or "yes" or "1" or "good" or "ok") return "GOOD";
-            if (lower is "false" or "0" or "bad" or "poor")        return "POOR";
-            if (lower == "no")                                        return "NO";
+            if (lower is "yes" or "true")               return "YES";
+            if (lower is "1" or "good" or "ok")         return "GOOD";
+            if (lower is "0" or "bad" or "poor")        return "POOR";
+            if (lower is "no" or "false")               return "NO";
             if (lower is "average" or "fair")                        return "AVERAGE";
             if (lower is "damaged" or "damage")                      return "DAMAGED";
             if (lower.StartsWith("missing") || lower is "not present" or "absent") return "MISSING";
@@ -618,16 +624,50 @@ namespace Valuation.Api.Services
                         break;
                 }
             }
-            return scores.Any() ? Math.Round(scores.Average(), 1) : (double?)null;
+            return scores.Any() ? Round1(scores.Average()) : (double?)null;
         }
+
+        /// <summary>
+        /// To one decimal place with the portal's arithmetic — round1 in inspection-score.ts,
+        /// Math.round(n * 10) / 10 — so the AVO page and the report agree to the digit.
+        /// Math.Round(x, 1) rounds exact halves to even: a TIRES card of AVERAGE with one
+        /// missing tyre is 3.25, which printed 3.2 here against 3.3 on screen.
+        /// </summary>
+        private static double Round1(double value) =>
+            Math.Round(value * 10, MidpointRounding.AwayFromZero) / 10;
 
         private double CalculateSystemScore(Dictionary<string, string?> items)
             => CalculateSystemScoreOrNull(items) ?? 8.0;
 
-        /// <summary>The fields of a section that count toward its score.</summary>
+        /// <summary>The fields of a section that count toward its score, each as the verdict it scores as.</summary>
         private Dictionary<string, string?> ScorableItems(SectionDef sec, InspectionDetails ins) =>
             sec.Fields.Where(f => f.Scored)
-                      .ToDictionary(f => f.Label, f => GetInsValue(ins, f.Key));
+                      .ToDictionary(f => f.Label, f => ScoresAs(f, GetInsValue(ins, f.Key)));
+
+        /// <summary>
+        /// An answer rewritten as the verdict it scores as, for the two rules where the
+        /// plain reading is backwards. Fluid Leaks: NO is the good answer, so NO scores as
+        /// GOOD and YES as NO. Missing Tyres: 0 scores as GOOD and any count above it as NO;
+        /// a blank or unreadable count is left out. Everything else scores as written.
+        /// </summary>
+        private static string? ScoresAs(FieldDef field, string? value)
+        {
+            var raw = value?.Trim() ?? "";
+            switch (field.Scoring)
+            {
+                case AnswerScoring.NoIsGood:
+                    var lower = raw.ToLowerInvariant();
+                    if (lower is "no" or "false")  return "GOOD";
+                    if (lower is "yes" or "true")  return "NO";
+                    return value;
+                case AnswerScoring.ZeroIsGood:
+                    if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var n) || n < 0)
+                        return null;
+                    return n == 0 ? "GOOD" : "NO";
+                default:
+                    return value;
+            }
+        }
 
         // Overall score = average of the same system card scores shown on page 3.
         // Sections without any inspection data are excluded from the average.
@@ -648,7 +688,7 @@ namespace Valuation.Api.Services
                     if (s.HasValue) sectionScores.Add(s.Value);
                 }
                 if (sectionScores.Any())
-                    return Math.Round(sectionScores.Average(), 1);
+                    return Round1(sectionScores.Average());
             }
             return ParseScoreValue(doc.QualityControl?.OverallRating);
         }
@@ -1807,14 +1847,32 @@ namespace Valuation.Api.Services
         // Every field is scored. Where an item does not apply to the vehicle the
         // inspector answers N/A, which MapVerdict excludes from the average — that
         // is the lever for "not a defect", rather than exempting field names here.
+        //
+        // Matches the 2026-09 checklist (VEHGA_REPORT_ALL_SEGMENTS_UPDATED) section for
+        // section, in the portal's order: the sheet's MECHANICAL column, then STRUCTURAL,
+        // then FUNCTIONALITY and OTHER SYSTEMS. Page 3 lays the cards out by that order.
         /// <summary>
         /// One row on a system card. <paramref name="Scored"/> false means the value is
         /// printed but excluded from the card's score — mirrors `scored` on
         /// InspectionField in the portal's inspection-field-registry.ts, which must be
         /// changed in the same commit or screen and report will disagree.
+        /// <paramref name="Kind"/> and <paramref name="Scoring"/> mirror `type: 'number'`
+        /// and `scoring` there.
         /// </summary>
-        private record FieldDef(string Label, string Key, bool Scored = true);
+        private record FieldDef(string Label, string Key, bool Scored = true,
+            AnswerKind Kind = AnswerKind.Condition, AnswerScoring Scoring = AnswerScoring.Condition);
         private record SectionDef(string Name, FieldDef[] Fields);
+
+        /// <summary>A dropdown answer (GOOD … YES / NO), or a typed count such as Number of Tyres.</summary>
+        private enum AnswerKind { Condition, Count }
+
+        /// <summary>
+        /// How an answer scores — the portal's answerPoints in inspection-score.ts.
+        /// Condition: as MapVerdict reads it (GOOD 8.5 … NO 1.0).
+        /// NoIsGood: the question asks about a fault (Fluid Leaks), so NO scores 8.5 and YES 1.0.
+        /// ZeroIsGood: a count of faults (Missing Tyres): 0 scores 8.5, 1 or more 1.0.
+        /// </summary>
+        private enum AnswerScoring { Condition, NoIsGood, ZeroIsGood }
 
         /// <summary>
         /// Sections printed but excluded from scoring, mirroring `scored: false` on
@@ -1834,349 +1892,502 @@ namespace Valuation.Api.Services
         {
             ["cv"] = new SectionDef[]
             {
-                new("BASIC SYSTEMS", new FieldDef[] {
-                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
-                    new("CABIN ASSY","cabinAssy"),             new("LOAD BODY ASSY","loadBodyAssy"),
-                    new("STEERING SYSTEM","steeringSystem"),   new("BRAKE SYSTEM","brakeSystem"),
-                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
-                    new("FUEL SYSTEM","fuelSystem"),           new("TYRE CONDITION","tyreCondition"),
-                }),
-                new("CABIN ASSEMBLY", new FieldDef[] {
-                    new("CABIN","cabin"), new("DASHBOARD","dashboard"),
-                    new("DOORS","doors"), new("ALL GLASSES","allGlasses"), new("SEATS","seats"),
-                }),
-                new("LOAD BODY", new FieldDef[] {
-                    new("RIGHT SIDE GATE","rightSideGate"), new("LEFT SIDE GATE","leftSideGate"),
-                    new("TAIL GATE","tailGate"),            new("LOAD FLOOR","loadFloor"),
-                }),
-                new("BRAKES", new FieldDef[] {
-                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs", Scored: false),
-                }),
-                new("ELECTRICAL SYSTEM", new FieldDef[] {
-                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
-                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
-                }),
-                new("COOLING SYSTEM", new FieldDef[] {
-                    new("RADIATOR","radiator"), new("INTER COOLER","intercooler"),
-                    new("ALL HOSE PIPES","allHosePipes"),
+                new("ENGINE CONDITION", new FieldDef[] {
+                    new("ENGINE CONDITION", "engineCondition"),
+                    new("FLUID LEAKS", "fluidLeaks", Scoring: AnswerScoring.NoIsGood),
+                    new("RADIATOR", "radiator"),
+                    new("ALL HOSE PIPES", "allHosePipes"),
+                    new("FUEL SYSTEM", "fuelSystem"),
                 }),
                 new("TRANSMISSION SYSTEM", new FieldDef[] {
-                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
-                    new("DIFFERENTIAL ASSY","differentialAssy"),
+                    new("GEARBOX ASSY", "gearBoxAssy"),
+                    new("CLUTCH SYSTEM", "clutchSystem"),
+                    new("DIFFERENTIAL ASSY", "differentialAssy"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKES", "frontBrakes"),
+                    new("REAR BRAKES", "rearBrakes"),
+                    new("PARKING BRAKE", "parkingBrake"),
+                    new("ABS", "abs", Scored: false),
                 }),
                 new("STEERING SYSTEM", new FieldDef[] {
-                    new("STEERING WHEEL","steeringWheel"), new("STEERING COLUMN","steeringColumn"),
-                    new("STEERING BOX","steeringBox"),
+                    new("STEERING WHEEL", "steeringWheel"),
+                    new("STEERING COLUMN", "steeringColumn"),
+                    new("STEERING BOX", "steeringBox"),
                 }),
                 new("SUSPENSION SYSTEM", new FieldDef[] {
-                    new("FRONT SUSPENSION","frontSuspension"), new("REAR SUSPENSION","rearSuspension"),
-                    new("FRONT & REAR AXLES","axles"),
+                    new("FRONT SUSPENSION", "frontSuspension"),
+                    new("REAR SUSPENSION", "rearSuspension"),
+                    new("FRONT & REAR AXLES", "axles"),
+                }),
+                new("CABIN ASSEMBLY", new FieldDef[] {
+                    new("CABIN", "cabin"),
+                    new("DASHBOARD", "dashboard"),
+                    new("DOORS", "doors"),
+                    new("ALL GLASSES", "allGlasses"),
+                    new("SEATS", "seats"),
+                }),
+                new("LOAD BODY", new FieldDef[] {
+                    new("BODY CONDITION", "bodyCondition"),
+                    new("RIGHT SIDE GATE", "rightSideGate"),
+                    new("LEFT SIDE GATE", "leftSideGate"),
+                    new("TAIL GATE", "tailGate"),
+                    new("LOAD FLOOR", "loadFloor"),
+                    new("CHASSIS / VEHICLE FRAME", "chassisCondition"),
+                    new("PAINT WORK", "paintWork"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS", "headLights"),
+                    new("TAIL LIGHTS / INDICATORS", "tailLightsIndicators"),
+                    new("BATTERY", "batteryCondition"),
+                    new("WIRING ASSY", "wiringAssy"),
+                    new("CLUSTER UNIT", "clusterUnit"),
+                }),
+                new("TIRES", new FieldDef[] {
+                    new("TYRE CONDITION", "tyreCondition"),
+                    new("NUMBER OF TYRES", "numberOfTyres", Scored: false, Kind: AnswerKind.Count),
+                    new("MISSING TYRES", "missingTyres", Kind: AnswerKind.Count, Scoring: AnswerScoring.ZeroIsGood),
+                }),
+                new("FUNCTIONALITY", new FieldDef[] {
+                    new("ENGINE STARTED", "engineStarted"),
+                    new("TEST DRIVE", "testDrive"),
+                    new("VEHICLE MOVED", "vehicleMoved"),
+                    new("WARNING LIGHTS", "warningLights"),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
-                    new("AIR CONDITIONER","airConditioner"), new("AUDIO","audio"),
-                    new("UPHOLSTERY","upholstery"),          new("HYDRAULIC LIFT","hydraulicLift"),
-                    new("FRONT CRASH GUARD","frontCrashGuard"), new("REAR CRASH GUARD","rearCrashGuard"),
-                    new("SIDE UNDER RUN PROTECTION","sideUnderRunProtection"), new("PAINT WORK","paintWork"),
+                    new("AUDIO", "audio"),
+                    new("UPHOLSTERY", "upholstery"),
+                    new("HYDRAULIC LIFT", "hydraulicLift"),
+                    new("FRONT CRASH GUARD", "frontCrashGuard"),
+                    new("REAR CRASH GUARD", "rearCrashGuard"),
+                    new("SIDE UNDER RUN PROTECTION", "sideUnderRunProtection"),
                 }),
             },
             ["4w"] = new SectionDef[]
             {
-                new("BASIC SYSTEMS", new FieldDef[] {
-                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
-                    new("CABIN ASSY","cabinAssy"),            new("BODY ASSY","bodyAssy"),
-                    new("STEERING SYSTEM","steeringSystem"),  new("BRAKE SYSTEM","brakeSystem"),
-                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
-                    new("FUEL SYSTEM","fuelSystem"),          new("TYRE CONDITION","tyreCondition"),
-                }),
-                new("EXTERIOR", new FieldDef[] {
-                    new("BONNET ASSY","bonnet"), new("BUMPERS","bumpers"),
-                    new("DOORS","doors"), new("ALL GLASSES","allGlasses"), new("SIDE FENDERS","sideFenders"),
-                }),
-                new("INTERIOR", new FieldDef[] {
-                    new("DASH BOARD","dashboard"), new("SEATS & MATS","seats"),
-                    new("UPHOLSTERY","upholstery"), new("INTERIOR TRIMS","interiorTrims"),
-                }),
-                new("BRAKES", new FieldDef[] {
-                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs", Scored: false),
-                }),
-                new("ELECTRICAL SYSTEM", new FieldDef[] {
-                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
-                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
-                }),
-                new("COOLING SYSTEM", new FieldDef[] {
-                    new("RADIATOR","radiator"), new("INTER COOLER","intercooler"),
-                    new("ALL HOSE PIPES","allHosePipes"),
+                new("ENGINE CONDITION", new FieldDef[] {
+                    new("ENGINE CONDITION", "engineCondition"),
+                    new("FLUID LEAKS", "fluidLeaks", Scoring: AnswerScoring.NoIsGood),
+                    new("RADIATOR", "radiator"),
+                    new("ALL HOSE PIPES", "allHosePipes"),
+                    new("FUEL SYSTEM", "fuelSystem"),
                 }),
                 new("TRANSMISSION SYSTEM", new FieldDef[] {
-                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
-                    new("DRIVE SHAFTS","driveShafts"),
+                    new("GEARBOX ASSY", "gearBoxAssy"),
+                    new("CLUTCH SYSTEM", "clutchSystem"),
+                    new("DRIVE SHAFTS", "driveShafts"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKES", "frontBrakes"),
+                    new("REAR BRAKES", "rearBrakes"),
+                    new("PARKING BRAKE", "parkingBrake"),
+                    new("ABS", "abs", Scored: false),
                 }),
                 new("STEERING SYSTEM", new FieldDef[] {
-                    new("STEERING WHEEL","steeringWheel"), new("STEERING COLUMN","steeringColumn"),
-                    new("STEERING BOX","steeringBox"),
+                    new("STEERING WHEEL", "steeringWheel"),
+                    new("STEERING COLUMN", "steeringColumn"),
+                    new("STEERING BOX", "steeringBox"),
                 }),
                 new("SUSPENSION SYSTEM", new FieldDef[] {
-                    new("FRONT SUSPENSION","frontSuspension"), new("REAR SUSPENSION","rearSuspension"),
-                    new("FRONT & REAR AXLES","axles"),
+                    new("FRONT SUSPENSION", "frontSuspension"),
+                    new("REAR SUSPENSION", "rearSuspension"),
+                    new("FRONT & REAR AXLES", "axles"),
+                }),
+                new("EXTERIOR", new FieldDef[] {
+                    new("BONNET ASSY", "bonnet"),
+                    new("BUMPERS", "bumpers"),
+                    new("DOORS", "doors"),
+                    new("ALL GLASSES", "allGlasses"),
+                    new("SIDE FENDERS", "sideFenders"),
+                    // Not on the 4W sheet; kept on request (2026-09-17), as in the portal.
+                    new("PAINT WORK", "paintWork"),
+                }),
+                new("INTERIOR", new FieldDef[] {
+                    new("DASH BOARD", "dashboard"),
+                    new("SEATS & MATS", "seats"),
+                    new("INTERIOR TRIMS", "interiorTrims"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS", "headLights"),
+                    new("TAIL LIGHTS / INDICATORS", "tailLightsIndicators"),
+                    new("BATTERY", "batteryCondition"),
+                    new("WIRING ASSY", "wiringAssy"),
+                    new("CLUSTER UNIT", "clusterUnit"),
+                }),
+                new("TIRES", new FieldDef[] {
+                    new("TYRE CONDITION", "tyreCondition"),
+                    new("NUMBER OF TYRES", "numberOfTyres", Scored: false, Kind: AnswerKind.Count),
+                    new("MISSING TYRES", "missingTyres", Kind: AnswerKind.Count, Scoring: AnswerScoring.ZeroIsGood),
+                }),
+                new("FUNCTIONALITY", new FieldDef[] {
+                    new("ENGINE STARTED", "engineStarted"),
+                    new("TEST DRIVE", "testDrive"),
+                    new("VEHICLE MOVED", "vehicleMoved"),
+                    new("WARNING LIGHTS", "warningLights"),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
-                    new("AIR CONDITIONER","airConditioner"), new("AUDIO","audio"),
-                    new("AIR BAGS","airBags"),               new("FRONT CRASH GUARD","frontCrashGuard"),
-                    new("REAR CRASH GUARD","rearCrashGuard"), new("SUN ROOF","sunRoof"),
-                    new("PAINT WORK","paintWork"),
+                    new("AUDIO", "audio"),
+                    new("AIR CONDITIONER", "airConditioner"),
+                    new("UPHOLSTERY", "upholstery"),
+                    new("SUN ROOF", "sunRoof"),
+                    new("REAR CRASH GUARD", "rearCrashGuard"),
+                    new("FRONT CRASH GUARD", "frontCrashGuard"),
                 }),
             },
             ["2w"] = new SectionDef[]
             {
-                new("BASIC SYSTEMS", new FieldDef[] {
-                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
-                    // Present in the VEHGA checklist (2W sheet, row 6) and collected by
-                    // the portal; it was missing here, so it was never printed or scored.
-                    new("CABIN ASSY","cabinAssy"),
-                    new("BODY CONDITION","bodyCondition"),     new("STEERING SYSTEM","steeringSystem"),
-                    new("BRAKE SYSTEM","brakeSystem"),         new("ELECTRICAL SYSTEM","electricalSystem"),
-                    new("SUSPENSION SYSTEM","suspensionSystem"),new("FUEL SYSTEM","fuelSystem"),
-                    new("TYRE CONDITION","tyreCondition"),
-                }),
-                new("EXTERIOR", new FieldDef[] {
-                    new("FUEL TANK ASSY","fuelTankCondition"), new("FRONT SCOOP","frontScoop"),
-                    new("SEAT","seatCondition"),               new("R/V MIRRORS","rvMirrors"),
-                    new("LOCK SET","lockSet"),
-                }),
-                new("BODY", new FieldDef[] {
-                    new("MUD GUARD - FRONT","frontMudGuard"), new("MUD GUARD - REAR","rearMudGuard"),
-                    new("SIDE COVERS","sideCovers"),          new("BELLY / FLOOR PANELS","bellyPanels"),
-                }),
-                new("BRAKES", new FieldDef[] {
-                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("BRAKE LEVERS / FLUID","brakeLeversFluid"), new("ABS","abs", Scored: false),
-                }),
-                new("ELECTRICAL SYSTEM", new FieldDef[] {
-                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
-                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
-                }),
-                new("COOLING SYSTEM", new FieldDef[] {
-                    new("RADIATOR","radiator"), new("SILENCER","silencer"),
-                    new("SILENCER COVER","silencerCover"),
+                new("ENGINE CONDITION", new FieldDef[] {
+                    new("ENGINE CONDITION", "engineCondition"),
+                    new("FLUID LEAKS", "fluidLeaks", Scoring: AnswerScoring.NoIsGood),
+                    new("RADIATOR", "radiator"),
+                    new("ALL HOSE PIPES", "allHosePipes"),
+                    new("FUEL SYSTEM", "fuelSystem"),
                 }),
                 new("TRANSMISSION SYSTEM", new FieldDef[] {
-                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
-                    new("ACCELERATOR","accelerator"),
+                    new("GEARBOX ASSY", "gearBoxAssy"),
+                    new("CLUTCH SYSTEM", "clutchSystem"),
+                    new("FINAL DRIVE / CHAIN", "finalDrive"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKE", "frontBrakes"),
+                    new("REAR BRAKE", "rearBrakes"),
+                    new("BRAKE LEVERS / FLUID", "brakeLeversFluid"),
+                    new("ABS", "abs", Scored: false),
                 }),
                 new("STEERING SYSTEM", new FieldDef[] {
-                    new("HANDLE BAR","handleBar"), new("STEERING STEM","steeringStem"),
-                    new("FRONT FORK","frontForkAssy"),
+                    new("HANDLE BAR", "handleBar"),
+                    new("STEERING STEM", "steeringStem"),
+                    new("FRONT FORK", "frontForkAssy"),
                 }),
                 new("SUSPENSION SYSTEM", new FieldDef[] {
-                    new("FRONT SHOCK ABSORBER","frontShockAbsorber"), new("REAR SHOCK ABSORBER","rearShockAbsorber"),
-                    new("ALLOY / WHEEL RIM","alloyWheelRim"),
+                    new("FRONT SHOCK ABSORBER", "frontShockAbsorber"),
+                    new("REAR SHOCK ABSORBER", "rearShockAbsorber"),
+                    new("ALLOY / WHEEL RIM", "alloyWheelRim"),
+                }),
+                new("EXTERIOR", new FieldDef[] {
+                    new("FUEL TANK ASSY", "fuelTankCondition"),
+                    new("FRONT SCOOP", "frontScoop"),
+                    new("SEAT", "seatCondition"),
+                    new("R/V MIRRORS", "rvMirrors"),
+                    new("LOCK SET", "lockSet"),
+                }),
+                new("BODY", new FieldDef[] {
+                    new("MUDGUARD - FRONT", "frontMudGuard"),
+                    new("MUDGUARD - REAR", "rearMudGuard"),
+                    new("SIDE COVERS (LH, RH)", "sideCovers"),
+                    new("BELLY / FLOOR PANELS", "bellyPanels"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS", "headLights"),
+                    new("TAIL LIGHTS / INDICATORS", "tailLightsIndicators"),
+                    new("BATTERY", "batteryCondition"),
+                    new("WIRING ASSY", "wiringAssy"),
+                    new("SWITCHES", "switches"),
+                }),
+                new("TIRES", new FieldDef[] {
+                    new("TYRE CONDITION", "tyreCondition"),
+                    new("NUMBER OF TYRES", "numberOfTyres", Scored: false, Kind: AnswerKind.Count),
+                    new("MISSING TYRES", "missingTyres", Kind: AnswerKind.Count, Scoring: AnswerScoring.ZeroIsGood),
+                }),
+                new("FUNCTIONALITY", new FieldDef[] {
+                    new("ENGINE STARTED", "engineStarted"),
+                    new("TEST RIDE", "testDrive"),
+                    new("VEHICLE MOVED", "vehicleMoved"),
+                    new("WARNING LIGHTS", "warningLights"),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
-                    new("MAIN STAND","mainStand"), new("SIDE STAND","sideStand"),
-                    new("LEG GUARD","legGuard"),   new("SAREE GUARD","sareeGuard"),
-                    new("HORN","horn"),             new("KICK PEDAL / FOOT REST","kickPedalFootRest"),
-                    new("CHAIN GUARD","chainGuard"), new("SELF START","selfStart"),
+                    new("MAIN STAND", "mainStand"),
+                    new("SIDE STAND", "sideStand"),
+                    new("HORN", "horn"),
+                    new("KICK PEDAL / FOOT REST", "kickPedalFootRest"),
+                    new("CHAIN GUARD", "chainGuard"),
+                    new("SELF START", "selfStart"),
                 }),
             },
             ["3w"] = new SectionDef[]
             {
-                new("BASIC SYSTEMS", new FieldDef[] {
-                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
-                    new("CABIN ASSY","cabinAssy"),            new("LOAD BODY ASSY","loadBodyAssy"),
-                    new("STEERING SYSTEM","steeringSystem"),  new("BRAKE SYSTEM","brakeSystem"),
-                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
-                    new("FUEL SYSTEM","fuelSystem"),          new("TYRE CONDITION","tyreCondition"),
-                }),
-                new("CABIN ASSEMBLY", new FieldDef[] {
-                    new("FRONT PANEL","frontPanel"), new("FR GLASS FRAME","frontGlassFrame"),
-                    new("DASH BOARD","dashboard"),   new("SEATS & MATS","seats"),
-                    new("MUDGUARDS","mudguards"),
-                }),
-                new("LOAD BODY", new FieldDef[] {
-                    new("RIGHT SIDE GATE","rightSideGate"), new("LEFT SIDE GATE","leftSideGate"),
-                    new("TAIL GATE","tailGate"),            new("LOAD FLOOR","loadFloor"),
-                }),
-                new("BRAKES", new FieldDef[] {
-                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs", Scored: false),
-                }),
-                new("ELECTRICAL SYSTEM", new FieldDef[] {
-                    new("LIGHTS","headLights"), new("BATTERY","batteryCondition"),
-                    new("WIRING ASSY","wiringAssy"), new("SWITCHES","switches"),
-                }),
-                new("COOLING SYSTEM", new FieldDef[] {
-                    new("RADIATOR","radiator"), new("INTER COOLER","intercooler"),
-                    new("ALL HOSE PIPES","allHosePipes"),
+                new("ENGINE CONDITION", new FieldDef[] {
+                    new("ENGINE CONDITION", "engineCondition"),
+                    new("FLUID LEAKS", "fluidLeaks", Scoring: AnswerScoring.NoIsGood),
+                    new("RADIATOR", "radiator"),
+                    new("ALL HOSE PIPES", "allHosePipes"),
+                    new("FUEL SYSTEM", "fuelSystem"),
                 }),
                 new("TRANSMISSION SYSTEM", new FieldDef[] {
-                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
-                    new("DIFFERENTIAL ASSY","differentialAssy"),
+                    new("GEARBOX ASSY", "gearBoxAssy"),
+                    new("CLUTCH SYSTEM", "clutchSystem"),
+                    new("DIFFERENTIAL ASSY", "differentialAssy"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKES", "frontBrakes"),
+                    new("REAR BRAKES", "rearBrakes"),
+                    new("PARKING BRAKE", "parkingBrake"),
+                    new("ABS", "abs", Scored: false),
                 }),
                 new("STEERING SYSTEM", new FieldDef[] {
-                    new("STEERING HANDLE","steeringHandle"), new("STEERING COLUMN","steeringColumn"),
-                    new("STEERING LINKAGES","steeringLinkages"),
+                    new("STEERING HANDLE", "steeringHandle"),
+                    new("STEERING COLUMN", "steeringColumn"),
+                    new("STEERING LINKAGES", "steeringLinkages"),
                 }),
                 new("SUSPENSION SYSTEM", new FieldDef[] {
-                    new("FRONT SUSPENSION","frontSuspension"), new("REAR SUSPENSION","rearSuspension"),
-                    new("FRONT & REAR AXLES","axles"),
+                    new("FRONT SUSPENSION", "frontSuspension"),
+                    new("REAR SUSPENSION", "rearSuspension"),
+                    new("FRONT & REAR AXLES", "axles"),
+                }),
+                new("CABIN ASSEMBLY", new FieldDef[] {
+                    new("FRONT PANEL", "frontPanel"),
+                    new("FR GLASS FRAME", "frontGlassFrame"),
+                    new("DASH BOARD", "dashboard"),
+                    new("SEATS & MATS", "seats"),
+                    new("MUDGUARDS", "mudguards"),
+                }),
+                new("LOAD BODY", new FieldDef[] {
+                    new("RIGHT SIDE GATE", "rightSideGate"),
+                    new("LEFT SIDE GATE", "leftSideGate"),
+                    new("TAIL GATE", "tailGate"),
+                    new("LOAD FLOOR", "loadFloor"),
+                    new("CHASSIS / VEHICLE FRAME", "chassisCondition"),
+                    new("PAINT WORK", "paintWork"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("LIGHTS", "headLights"),
+                    new("TAIL LIGHTS / INDICATORS", "tailLightsIndicators"),
+                    new("BATTERY", "batteryCondition"),
+                    new("WIRING ASSY", "wiringAssy"),
+                    new("SWITCHES", "switches"),
+                }),
+                new("TIRES", new FieldDef[] {
+                    new("TYRE CONDITION", "tyreCondition"),
+                    new("NUMBER OF TYRES", "numberOfTyres", Scored: false, Kind: AnswerKind.Count),
+                    new("MISSING TYRES", "missingTyres", Kind: AnswerKind.Count, Scoring: AnswerScoring.ZeroIsGood),
+                }),
+                new("FUNCTIONALITY", new FieldDef[] {
+                    new("ENGINE STARTED", "engineStarted"),
+                    new("TEST DRIVE", "testDrive"),
+                    new("VEHICLE MOVED", "vehicleMoved"),
+                    new("WARNING LIGHTS", "warningLights"),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
-                    new("AIR CONDITIONER","airConditioner"), new("AUDIO","audio"),
-                    new("UPHOLSTERY","upholstery"),          new("LOAD CARRIER","loadCarrier"),
-                    new("FRONT CRASH GUARD","frontCrashGuard"), new("REAR CRASH GUARD","rearCrashGuard"),
-                    new("SIDE MIRRORS","sideMirrors"),       new("PAINT WORK","paintWork"),
+                    new("AUDIO", "audio"),
+                    new("UPHOLSTERY", "upholstery"),
+                    new("LOAD CARRIER", "loadCarrier"),
+                    new("FRONT CRASH GUARD", "frontCrashGuard"),
+                    new("REAR CRASH GUARD", "rearCrashGuard"),
+                    new("SIDE MIRRORS", "sideMirrors"),
                 }),
             },
             ["ce"] = new SectionDef[]
             {
-                new("BASIC SYSTEMS", new FieldDef[] {
-                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS / FRAME CONDITION","chassisCondition"),
-                    new("CABIN ASSY","cabinAssy"),             new("HYDRAULIC SYSTEM","hydraulicSystem"),
-                    new("STEERING / CONTROL SYSTEM","steeringControlSystem"), new("BRAKE SYSTEM","brakeSystem"),
-                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
-                    new("FUEL SYSTEM","fuelSystem"),           new("TYRE / TRACK CONDITION","tyreCondition"),
-                }),
-                new("CABIN ASSY", new FieldDef[] {
-                    new("CABIN STRUCTURE","cabinStructure"), new("DASHBOARD & CONTROLS","dashboardControls"),
-                    new("DOORS","doors"),                    new("GLASS PANELS","glassPanels"),
-                    new("SEAT","seats"),
-                }),
-                new("ATTACHMENTS", new FieldDef[] {
-                    new("BOOM / ARM","boomArm"),          new("BUCKET / BLADE","bucketBlade"),
-                    new("COUNTER WEIGHT","counterWeight"), new("PINS & BUSHES","pinsAndBushes"),
-                }),
-                new("BRAKES", new FieldDef[] {
-                    new("SERVICE BRAKE","serviceBrake"), new("RETARDER","retarder"),
-                    new("PARKING BRAKE","parkingBrake"), new("EMERGENCY STOP","emergencyStop"),
-                }),
-                new("ELECTRICAL SYSTEM", new FieldDef[] {
-                    new("LIGHTS","headLights"), new("BATTERY","batteryCondition"),
-                    new("WIRING ASSY","wiringAssy"), new("SENSORS","sensors"),
-                }),
-                new("COOLING SYSTEM", new FieldDef[] {
-                    new("RADIATOR","radiator"), new("HYDRAULIC OIL COOLER","hydraulicOilCooler"),
-                    new("ALL HOSE PIPES","allHosePipes"),
+                new("ENGINE CONDITION", new FieldDef[] {
+                    new("ENGINE CONDITION", "engineCondition"),
+                    new("FLUID LEAKS", "fluidLeaks", Scoring: AnswerScoring.NoIsGood),
+                    new("RADIATOR", "radiator"),
+                    new("HYDRAULIC OIL COOLER", "hydraulicOilCooler"),
+                    new("FUEL SYSTEM", "fuelSystem"),
                 }),
                 new("TRANSMISSION SYSTEM", new FieldDef[] {
-                    new("GEARBOX ASSY","gearBoxAssy"), new("TORQUE CONVERTER","torqueConverter"),
-                    new("FINAL DRIVE","finalDrive"),
+                    new("GEARBOX ASSY", "gearBoxAssy"),
+                    new("TORQUE CONVERTER", "torqueConverter"),
+                    new("FINAL DRIVE", "finalDrive"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("SERVICE BRAKE", "serviceBrake"),
+                    new("RETARDER", "retarder"),
+                    new("PARKING BRAKE", "parkingBrake"),
+                    new("EMERGENCY STOP", "emergencyStop"),
                 }),
                 new("STEERING SYSTEM", new FieldDef[] {
-                    new("STEERING / CONTROL LEVERS","steeringControlLevers"),
-                    new("HYDRAULIC STEERING PUMP","hydraulicSteeringPump"),
-                    new("SWIVEL JOINTS","swivelJoints"),
+                    new("STEERING / CONTROL LEVERS", "steeringControlLevers"),
+                    new("HYDRAULIC STEERING PUMP", "hydraulicSteeringPump"),
+                    new("SWIVEL JOINTS", "swivelJoints"),
                 }),
                 new("HYDRAULIC SYSTEM", new FieldDef[] {
-                    new("HYDRAULIC PUMP","hydraulicPump"), new("CYLINDERS","hydraulicCylinders"),
-                    new("HOSES & FITTINGS","hosesAndFittings"),
+                    new("HYDRAULIC PUMP", "hydraulicPump"),
+                    new("CYLINDERS", "hydraulicCylinders"),
+                    new("HOSES & FITTINGS", "hosesAndFittings"),
+                }),
+                new("CABIN ASSEMBLY", new FieldDef[] {
+                    new("CABIN STRUCTURE", "cabinStructure"),
+                    new("DASH BOARD & CONTROLS", "dashboardControls"),
+                    new("DOORS", "doors"),
+                    new("GLASS PANELS", "glassPanels"),
+                    new("SEAT", "seats"),
+                }),
+                new("ATTACHMENTS", new FieldDef[] {
+                    new("BOOM / ARM", "boomArm"),
+                    new("BUCKET / BLADE", "bucketBlade"),
+                    new("COUNTER WEIGHT", "counterWeight"),
+                    new("PAINT WORK", "paintWork"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("LIGHTS", "headLights"),
+                    new("WARNING / INDICATOR LIGHTS", "warningIndicatorLights"),
+                    new("BATTERY", "batteryCondition"),
+                    new("WIRING ASSY", "wiringAssy"),
+                    new("SENSORS", "sensors"),
+                }),
+                new("TIRE / TRACK", new FieldDef[] {
+                    new("TYRE / TRACK CONDITION", "tyreCondition"),
+                    new("NUMBER OF TYRES / TRACKS", "numberOfTyres", Scored: false, Kind: AnswerKind.Count),
+                    new("MISSING / DAMAGED", "missingTyres", Kind: AnswerKind.Count, Scoring: AnswerScoring.ZeroIsGood),
+                }),
+                new("FUNCTIONALITY", new FieldDef[] {
+                    new("ENGINE STARTED", "engineStarted"),
+                    new("FUNCTIONAL TEST", "testDrive"),
+                    new("MACHINE MOVED", "vehicleMoved"),
+                    new("WARNING LIGHTS", "warningLights"),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
-                    new("SWING MECHANISM","swingMechanism"), new("TRACK CHAINS","trackChains"),
-                    new("SPROCKETS","sprockets"),            new("ROLLERS","rollers"),
-                    new("HOUR METER","hourMeter"),           new("BONNET / GUARD","bonnetGuard"),
-                    new("ROCK BREAKER","rockBreaker"),       new("PAINT WORK","paintWork"),
+                    new("SWING MECHANISM", "swingMechanism"),
+                    new("TRACK CHAINS", "trackChains"),
+                    new("SPROCKETS", "sprockets"),
+                    new("ROLLERS", "rollers"),
+                    new("HOUR METER", "hourMeter"),
+                    new("ROCK BREAKER", "rockBreaker"),
                 }),
             },
             ["bus"] = new SectionDef[]
             {
-                new("BASIC SYSTEMS", new FieldDef[] {
-                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
-                    new("COACH CONDITION","coachCondition"),   new("BODY STRUCTURE","bodyStructure"),
-                    new("STEERING SYSTEM","steeringSystem"),   new("BRAKE SYSTEM","brakeSystem"),
-                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
-                    new("FUEL SYSTEM","fuelSystem"),           new("TYRE CONDITION","tyreCondition"),
-                }),
-                new("COACH ASSEMBLY", new FieldDef[] {
-                    new("DRIVER CABIN","driverCabin"), new("DASHBOARD","dashboard"),
-                    new("DOORS","doors"),               new("ALL GLASSES","allGlasses"),
-                    new("BUMPERS & GRILLES","bumpersAndGrilles"),
-                }),
-                new("BODY ASSY", new FieldDef[] {
-                    new("SEATS & BERTHS","seatsAndBerths"), new("INTERIOR TRIMS","interiorTrims"),
-                    new("SIDE BODY PANELS","sideBodyPanels"), new("REAR BODY PANELS","rearBodyPanels"),
-                }),
-                new("BRAKES", new FieldDef[] {
-                    new("FRONT BRAKES","frontBrakes"), new("REAR BRAKES","rearBrakes"),
-                    new("PARKING BRAKE","parkingBrake"), new("ABS","abs", Scored: false),
-                }),
-                new("ELECTRICAL SYSTEM", new FieldDef[] {
-                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
-                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
-                }),
-                new("COOLING SYSTEM", new FieldDef[] {
-                    new("RADIATOR","radiator"), new("INTER COOLER","intercooler"),
-                    new("ALL HOSE PIPES","allHosePipes"),
+                new("ENGINE CONDITION", new FieldDef[] {
+                    new("ENGINE CONDITION", "engineCondition"),
+                    new("FLUID LEAKS", "fluidLeaks", Scoring: AnswerScoring.NoIsGood),
+                    new("RADIATOR", "radiator"),
+                    new("ALL HOSE PIPES", "allHosePipes"),
+                    new("FUEL SYSTEM", "fuelSystem"),
                 }),
                 new("TRANSMISSION SYSTEM", new FieldDef[] {
-                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
-                    new("DIFFERENTIAL ASSY","differentialAssy"),
+                    new("GEARBOX ASSY", "gearBoxAssy"),
+                    new("CLUTCH SYSTEM", "clutchSystem"),
+                    new("DIFFERENTIAL ASSY", "differentialAssy"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("FRONT BRAKES", "frontBrakes"),
+                    new("REAR BRAKES", "rearBrakes"),
+                    new("PARKING BRAKE", "parkingBrake"),
+                    new("ABS", "abs", Scored: false),
                 }),
                 new("STEERING SYSTEM", new FieldDef[] {
-                    new("STEERING WHEEL","steeringWheel"), new("STEERING COLUMN","steeringColumn"),
-                    new("STEERING BOX","steeringBox"),
+                    new("STEERING WHEEL", "steeringWheel"),
+                    new("STEERING COLUMN", "steeringColumn"),
+                    new("STEERING BOX", "steeringBox"),
                 }),
                 new("SUSPENSION SYSTEM", new FieldDef[] {
-                    new("FRONT SUSPENSION","frontSuspension"), new("REAR SUSPENSION","rearSuspension"),
-                    new("FRONT & REAR AXLES","axles"),
+                    new("FRONT SUSPENSION", "frontSuspension"),
+                    new("REAR SUSPENSION", "rearSuspension"),
+                    new("FRONT & REAR AXLES", "axles"),
+                }),
+                new("COACH ASSEMBLY", new FieldDef[] {
+                    new("DRIVER CABIN", "driverCabin"),
+                    new("DASHBOARD", "dashboard"),
+                    new("DOORS", "doors"),
+                    new("ALL GLASSES", "allGlasses"),
+                    new("BUMPERS & GRILLES", "bumpersAndGrilles"),
+                }),
+                new("BODY ASSEMBLY", new FieldDef[] {
+                    new("SEATS & BERTHS", "seatsAndBerths"),
+                    new("INTERIOR TRIMS", "interiorTrims"),
+                    new("SIDE BODY PANELS", "sideBodyPanels"),
+                    new("REAR BODY PANELS", "rearBodyPanels"),
+                    new("CHASSIS / BODY FRAME", "chassisCondition"),
+                    new("PAINT WORK", "paintWork"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS", "headLights"),
+                    new("TAIL LIGHTS / INDICATORS", "tailLightsIndicators"),
+                    new("BATTERY", "batteryCondition"),
+                    new("WIRING ASSY", "wiringAssy"),
+                    new("CLUSTER UNIT", "clusterUnit"),
+                }),
+                new("TIRES", new FieldDef[] {
+                    new("TYRE CONDITION", "tyreCondition"),
+                    new("NUMBER OF TYRES", "numberOfTyres", Scored: false, Kind: AnswerKind.Count),
+                    new("MISSING TYRES", "missingTyres", Kind: AnswerKind.Count, Scoring: AnswerScoring.ZeroIsGood),
+                }),
+                new("FUNCTIONALITY", new FieldDef[] {
+                    new("ENGINE STARTED", "engineStarted"),
+                    new("TEST DRIVE", "testDrive"),
+                    new("VEHICLE MOVED", "vehicleMoved"),
+                    new("WARNING LIGHTS", "warningLights"),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
-                    new("AIR CONDITIONER","airConditioner"), new("AUDIO","audio"),
-                    new("UPHOLSTERY","upholstery"),          new("LOAD CARRIER","loadCarrier"),
-                    new("FRONT CRASH GUARD","frontCrashGuard"), new("REAR CRASH GUARD","rearCrashGuard"),
-                    new("SIDE MIRRORS","sideMirrors"),       new("PAINT WORK","paintWork"),
+                    new("AIR CONDITIONER", "airConditioner"),
+                    new("AUDIO", "audio"),
+                    new("UPHOLSTERY", "upholstery"),
+                    new("LOAD CARRIER", "loadCarrier"),
+                    new("FRONT CRASH GUARD", "frontCrashGuard"),
+                    new("REAR CRASH GUARD", "rearCrashGuard"),
                 }),
             },
             ["fe"] = new SectionDef[]
             {
-                new("BASIC SYSTEMS", new FieldDef[] {
-                    new("ENGINE CONDITION","engineCondition"), new("CHASSIS CONDITION","chassisCondition"),
-                    new("OPERATOR PLATFORM","operatorPlatform"),new("BODY ASSY","bodyAssy"),
-                    new("STEERING SYSTEM","steeringSystem"),   new("BRAKE SYSTEM","brakeSystem"),
-                    new("ELECTRICAL SYSTEM","electricalSystem"),new("SUSPENSION SYSTEM","suspensionSystem"),
-                    new("FUEL SYSTEM","fuelSystem"),           new("TYRE CONDITION","tyreCondition"),
-                }),
-                new("CABIN ASSEMBLY", new FieldDef[] {
-                    new("OPERATOR STATION","operatorStation"), new("DASH BOARD","dashboard"),
-                    new("CANOPY","canopy"),                    new("LOCK SET","lockSet"),
-                    new("SEAT","seats"),
-                }),
-                new("BODY ASSY", new FieldDef[] {
-                    new("BONNET","bonnet"), new("FRONT GRILLES","frontGrilles"),
-                    new("SIDE FENDERS","sideFenders"), new("FUEL TANK","fuelTankFe"),
-                }),
-                new("BRAKES", new FieldDef[] {
-                    new("RIGHT INDIVIDUAL BRAKES","rightIndividualBrakes"),
-                    new("LEFT INDIVIDUAL BRAKES","leftIndividualBrakes"),
-                    new("PARKING BRAKE","parkingBrake"),
-                    new("BRAKE EQUALIZATION","brakeEqualization"),
-                }),
-                new("ELECTRICAL SYSTEM", new FieldDef[] {
-                    new("HEAD LIGHTS","headLights"), new("TAIL LIGHTS / INDICATORS","tailLightsIndicators"),
-                    new("BATTERY","batteryCondition"), new("WIRING ASSY","wiringAssy"),
-                }),
-                new("COOLING SYSTEM", new FieldDef[] {
-                    new("RADIATOR","radiator"), new("FAN ASSY","fanAssy"),
-                    new("ALL HOSE PIPES","allHosePipes"),
+                new("ENGINE CONDITION", new FieldDef[] {
+                    new("ENGINE CONDITION", "engineCondition"),
+                    new("FLUID LEAKS", "fluidLeaks", Scoring: AnswerScoring.NoIsGood),
+                    new("RADIATOR", "radiator"),
+                    new("ALL HOSE PIPES", "allHosePipes"),
+                    new("FUEL SYSTEM", "fuelSystem"),
                 }),
                 new("TRANSMISSION SYSTEM", new FieldDef[] {
-                    new("GEARBOX ASSY","gearBoxAssy"), new("CLUTCH SYSTEM","clutchSystem"),
-                    new("DIFFERENTIAL ASSY","differentialAssy"),
+                    new("GEARBOX ASSY", "gearBoxAssy"),
+                    new("CLUTCH SYSTEM", "clutchSystem"),
+                    new("DIFFERENTIAL ASSY", "differentialAssy"),
+                }),
+                new("BRAKES", new FieldDef[] {
+                    new("RIGHT INDIVIDUAL BRAKES", "rightIndividualBrakes"),
+                    new("LEFT INDIVIDUAL BRAKES", "leftIndividualBrakes"),
+                    new("PARKING BRAKE", "parkingBrake"),
+                    new("BRAKE EQUALIZATION", "brakeEqualization"),
                 }),
                 new("STEERING SYSTEM", new FieldDef[] {
-                    new("STEERING WHEEL","steeringWheel"), new("STEERING COLUMN","steeringColumn"),
-                    new("STEERING BOX","steeringBox"),
+                    new("STEERING WHEEL", "steeringWheel"),
+                    new("STEERING COLUMN", "steeringColumn"),
+                    new("STEERING BOX", "steeringBox"),
                 }),
                 new("SUSPENSION SYSTEM", new FieldDef[] {
-                    new("FRONT AXLE","frontAxleFe"), new("REAR AXLE","rearAxleFe"),
-                    new("TIE RODS & JOINTS","tieRodsJoints"),
+                    new("FRONT AXLE", "frontAxleFe"),
+                    new("REAR AXLE", "rearAxleFe"),
+                    new("TIE RODS & JOINTS", "tieRodsJoints"),
+                }),
+                new("CABIN ASSEMBLY", new FieldDef[] {
+                    new("OPERATOR STATION", "operatorStation"),
+                    new("DASH BOARD", "dashboard"),
+                    new("CANOPY", "canopy"),
+                    new("LOCK SET", "lockSet"),
+                    new("SEAT", "seats"),
+                }),
+                new("BODY ASSEMBLY", new FieldDef[] {
+                    new("BONNET", "bonnet"),
+                    new("FRONT GRILLES", "frontGrilles"),
+                    new("SIDE FENDERS", "sideFenders"),
+                    new("FUEL TANK", "fuelTankFe"),
+                    new("OPERATOR PLATFORM", "operatorPlatform"),
+                    new("PAINT WORK", "paintWork"),
+                }),
+                new("ELECTRICAL SYSTEM", new FieldDef[] {
+                    new("HEAD LIGHTS", "headLights"),
+                    new("TAIL LIGHTS / INDICATORS", "tailLightsIndicators"),
+                    new("BATTERY", "batteryCondition"),
+                    new("WIRING ASSY", "wiringAssy"),
+                    new("SWITCHES", "switches"),
+                }),
+                new("TIRES", new FieldDef[] {
+                    new("TYRE CONDITION", "tyreCondition"),
+                    new("NUMBER OF TYRES", "numberOfTyres", Scored: false, Kind: AnswerKind.Count),
+                    new("MISSING TYRES", "missingTyres", Kind: AnswerKind.Count, Scoring: AnswerScoring.ZeroIsGood),
+                }),
+                new("FUNCTIONALITY", new FieldDef[] {
+                    new("ENGINE STARTED", "engineStarted"),
+                    new("FIELD FUNCTION TEST", "testDrive"),
+                    new("VEHICLE MOVED", "vehicleMoved"),
+                    new("WARNING LIGHTS", "warningLights"),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
-                    new("MUFFLER","muffler"),              new("AIR FILTER","airFilter"),
-                    new("ATTACHMENT HITCH","attachmentHitch"), new("HYDRAULIC LIFT ARM","hydraulicLiftFe"),
-                    new("FRONT CRASH GUARD","frontCrashGuard"), new("DROP ARM","dropArm"),
-                    new("REAR DRAWBAR","rearDrawbar"),     new("PAINT WORK","paintWork"),
+                    new("MUFFLER", "muffler"),
+                    new("AIR FILTER", "airFilter"),
+                    new("ATTACHMENT HITCH", "attachmentHitch"),
+                    new("HYDRAULIC LIFT ARM", "hydraulicLiftFe"),
+                    new("DROP ARM", "dropArm"),
+                    new("REAR DRAWBAR", "rearDrawbar"),
                 }),
             },
         };
@@ -2229,18 +2440,35 @@ namespace Valuation.Api.Services
 
         private static string GetSectionIcon(string name) => name switch
         {
-            "BASIC SYSTEMS"                             => SVGIcons.Basic,
+            "ENGINE CONDITION"                          => SVGIcons.Engine,
             "BRAKES"                                    => SVGIcons.Brakes,
             "ELECTRICAL SYSTEM"                         => SVGIcons.Electrical,
-            "COOLING SYSTEM"                            => SVGIcons.Cooling,
             "TRANSMISSION SYSTEM"                       => SVGIcons.Transmission,
             "STEERING SYSTEM"                           => SVGIcons.Steering,
             "SUSPENSION SYSTEM"                         => SVGIcons.Suspension,
-            "CABIN ASSEMBLY" or "CABIN ASSY" or "COACH ASSEMBLY" => SVGIcons.Cabin,
-            "LOAD BODY" or "BODY ASSY" or "EXTERIOR" or "INTERIOR" => SVGIcons.LoadBody,
+            "CABIN ASSEMBLY" or "COACH ASSEMBLY"        => SVGIcons.Cabin,
+            "LOAD BODY" or "BODY" or "BODY ASSEMBLY" or "EXTERIOR" or "INTERIOR" => SVGIcons.LoadBody,
             "ATTACHMENTS" or "HYDRAULIC SYSTEM"         => SVGIcons.Cooling,
+            "TIRES" or "TIRE / TRACK"                   => SVGIcons.Tyres,
+            "FUNCTIONALITY"                             => SVGIcons.Functionality,
             _                                           => SVGIcons.Other,
         };
+
+        /// <summary>
+        /// Sections drawn side by side beneath the mechanical / structural grid on page 3.
+        /// The checklist sheet runs each of them full width, but two full-width cards need
+        /// ~799pt for a CV against the page's ~796pt, which pushed the last row of OTHER
+        /// SYSTEMS onto a page of its own. Side by side they end near 775pt.
+        /// </summary>
+        private static readonly HashSet<string> BottomRowSections =
+            new(StringComparer.OrdinalIgnoreCase) { "FUNCTIONALITY", "OTHER SYSTEMS" };
+
+        /// <summary>
+        /// How many sections make up the sheet's MECHANICAL column — engine, transmission,
+        /// brakes, steering, and suspension (hydraulics on CE). Every registry lists them
+        /// first, so page 3 puts these on the left and the STRUCTURAL ones on the right.
+        /// </summary>
+        private const int MechanicalSectionCount = 5;
 
         private void ComposeSystemScoresPage(ColumnDescriptor main, ValuationDocument doc)
         {
@@ -2256,17 +2484,17 @@ namespace Valuation.Api.Services
             if (!PdfFieldRegistry.TryGetValue(vk, out var allSections) || allSections.Length == 0)
                 allSections = PdfFieldRegistry["cv"];
 
-            // Last section is OTHER SYSTEMS — rendered full-width at bottom in 2 columns
-            var mainSections = allSections.Take(allSections.Length - 1).ToArray();
-            var otherSection = allSections.Last();
+            // Laid out as the checklist sheet is: MECHANICAL cards on the left, STRUCTURAL on
+            // the right, then FUNCTIONALITY and OTHER SYSTEMS underneath.
+            var bottomSections = allSections.Where(s => BottomRowSections.Contains(s.Name)).ToArray();
+            var cardSections   = allSections.Where(s => !BottomRowSections.Contains(s.Name)).ToArray();
 
-            // 4 sections on the left, rest on the right — balances heavy BASIC SYSTEMS against lighter right-side sections
-            int mid = Math.Min(4, mainSections.Length);
-            var leftSections  = mainSections.Take(mid).ToArray();
-            var rightSections = mainSections.Skip(mid).ToArray();
+            int mid = Math.Min(MechanicalSectionCount, cardSections.Length);
+            var leftSections  = cardSections.Take(mid).ToArray();
+            var rightSections = cardSections.Skip(mid).ToArray();
 
-            Dictionary<string, string?> BuildItems(SectionDef sec) =>
-                sec.Fields.ToDictionary(f => f.Label, f => GetInsValue(ins, f.Key));
+            List<(FieldDef Field, string? Value)> BuildItems(SectionDef sec) =>
+                sec.Fields.Select(f => (f, GetInsValue(ins, f.Key))).ToList();
 
             // Every field is listed; only the scored ones move the number.
             Dictionary<string, string?>? BuildScoreItems(SectionDef sec) =>
@@ -2289,9 +2517,51 @@ namespace Valuation.Api.Services
                 });
             });
 
-            // OTHER SYSTEMS spans full width with fields in 2 columns
-            main.Item().Element(c => DrawSystemCard(c, SVGIcons.Other, otherSection.Name,
-                BuildItems(otherSection), BuildScoreItems(otherSection), twoColumns: true));
+            main.Item().Row(row =>
+            {
+                for (int i = 0; i < bottomSections.Length; i++)
+                {
+                    var sec = bottomSections[i];
+                    if (i > 0) row.ConstantItem(8);
+                    row.RelativeItem().Element(c => DrawSystemCard(c, GetSectionIcon(sec.Name), sec.Name,
+                        BuildItems(sec), BuildScoreItems(sec)));
+                }
+            });
+        }
+
+        /// <summary>
+        /// What one answer prints as on its card, and the pill colours. A count prints as the
+        /// number itself — Missing Tyres green at 0 and red above it, Number of Tyres in
+        /// neutral grey. Fluid Leaks turns the colours round, since NO is the good answer there.
+        /// </summary>
+        private (string Text, string Bg, string Fg) AnswerPill(FieldDef field, string? value)
+        {
+            const string GoodBg = "#ECFDF5", GoodFg = "#059669";
+            const string AverageBg = "#FFF7ED", AverageFg = "#D97706";
+            const string BadBg = "#FEF2F2", BadFg = "#DC2626";
+            const string NeutralBg = "#F1F5F9", NeutralFg = "#64748B";
+
+            if (field.Kind == AnswerKind.Count)
+            {
+                var count = value?.Trim();
+                if (string.IsNullOrEmpty(count)) return ("NA", NeutralBg, NeutralFg);
+                return ScoresAs(field, count) switch
+                {
+                    "GOOD" => (count, GoodBg, GoodFg),
+                    "NO"   => (count, BadBg, BadFg),
+                    _      => (count, NeutralBg, NeutralFg),
+                };
+            }
+
+            var verdict = MapVerdict(value);
+            // The colour follows what the answer scores as; the text stays what the AVO chose.
+            return MapVerdict(ScoresAs(field, value)) switch
+            {
+                "GOOD" or "YES" => (verdict, GoodBg, GoodFg),
+                "AVERAGE"       => (verdict, AverageBg, AverageFg),
+                "POOR" or "BAD" or "NO" or "DAMAGED" or "MISSING" => (verdict, BadBg, BadFg),
+                _               => (verdict, NeutralBg, NeutralFg),
+            };
         }
 
         /// <summary>
@@ -2300,7 +2570,7 @@ namespace Valuation.Api.Services
         /// that is not scored at all, and the badge says so instead of printing a figure.
         /// </summary>
         private void DrawSystemCard(IContainer container, string iconSvg, string title,
-            Dictionary<string, string?> items, Dictionary<string, string?>? scoreItems,
+            List<(FieldDef Field, string? Value)> items, Dictionary<string, string?>? scoreItems,
             bool twoColumns = false)
         {
             var scoreStr = scoreItems is null
@@ -2346,25 +2616,17 @@ namespace Valuation.Api.Services
                             else { cd.RelativeColumn(); }
                         });
 
-                        var itemsList = items.ToList();
                         int colIndex  = 0;
-                        foreach (var item in itemsList)
+                        foreach (var item in items)
                         {
-                            var verdict = MapVerdict(item.Value);
-
-                            string pillBg, pillFg;
-                            if (verdict is "GOOD" or "YES")              { pillBg = "#ECFDF5"; pillFg = "#059669"; }
-                            else if (verdict == "AVERAGE")               { pillBg = "#FFF7ED"; pillFg = "#D97706"; }
-                            else if (verdict is "POOR" or "BAD" or "NO" or "DAMAGED" or "MISSING")
-                                                                         { pillBg = "#FEF2F2"; pillFg = "#DC2626"; }
-                            else                                         { pillBg = "#F1F5F9"; pillFg = "#64748B"; }
+                            var (verdict, pillBg, pillFg) = AnswerPill(item.Field, item.Value);
 
                             void BuildCell(IContainer c)
                             {
                                 c.PaddingVertical(2.5f).Row(r =>
                                 {
                                     r.RelativeItem().AlignMiddle()
-                                        .Text(item.Key).FontSize(8f).FontColor(LabelSlate);
+                                        .Text(item.Field.Label).FontSize(8f).FontColor(LabelSlate);
 
                                     r.AutoItem().Layers(vl =>
                                     {
@@ -2401,6 +2663,10 @@ namespace Valuation.Api.Services
             public const string Cooling      = @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1E293B"" stroke-width=""2""><path d=""M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z""/></svg>";
             public const string Suspension   = @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1E293B"" stroke-width=""2""><path d=""M8 4l4-2 4 2M8 20l4 2 4-2M12 2v20m-4-6h8m-8-8h8""/></svg>";
             public const string Other        = @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1E293B"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""9""/><path d=""M12 8v8m-4-4h8""/></svg>";
+            // 2026-09 checklist sections. Engine reuses the cover's engine-number cog.
+            public const string Engine        = @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1E293B"" stroke-width=""2"">" + RowIcons.Engine + "</svg>";
+            public const string Tyres         = @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1E293B"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""10""/><circle cx=""12"" cy=""12"" r=""6""/><circle cx=""12"" cy=""12"" r=""2""/></svg>";
+            public const string Functionality = @"<svg viewBox=""0 0 24 24"" fill=""none"" stroke=""#1E293B"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""9""/><path d=""m9 12 2 2 4-4""/></svg>";
         }
 
         /// <summary>

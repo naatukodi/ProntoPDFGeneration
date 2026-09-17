@@ -7,8 +7,10 @@ namespace Valuation.Api.Models
         public string VehicleInspectedBy { get; set; } = default!;
         public DateTime? DateOfInspection { get; set; }
         public string? InspectionLocation { get; set; }
-        public bool? VehicleMoved { get; set; }
-        public bool? EngineStarted { get; set; }
+        // Text since the 2026-09 checklist: the API now saves YES / NO / GOOD …, which a bool?
+        // cannot read — the whole case would fail to load. Older cases hold "true"/"false".
+        public string? VehicleMoved { get; set; }
+        public string? EngineStarted { get; set; }
         public long? Odometer { get; set; }
         public bool? VinPlate { get; set; }
         public string? BodyType { get; set; }
@@ -268,6 +270,17 @@ namespace Valuation.Api.Models
         public string? AirFilter { get; set; }
         public string? DropArm { get; set; }
         public string? AttachmentHitch { get; set; }
+
+        // --- 2026-09 checklist (VEHGA_REPORT_ALL_SEGMENTS_UPDATED) ---
+        // Page 3 reads fields by name through GetInsValue, so a property missing here
+        // prints as NA even when the AVO answered it.
+        public string? FluidLeaks { get; set; }
+        public string? ClusterUnit { get; set; }
+        public string? WarningIndicatorLights { get; set; }
+        public string? NumberOfTyres { get; set; }
+        public string? MissingTyres { get; set; }
+        public string? TestDrive { get; set; }
+        public string? WarningLights { get; set; }
 
         public DateTime? CreatedAt { get; set; }
         public DateTime? UpdatedAt { get; set; }
