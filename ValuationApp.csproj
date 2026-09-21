@@ -15,6 +15,11 @@
     <!-- Report assets (Vehga logo). Without this the folder never reaches the
          publish output, and the header silently falls back to plain text. -->
     <Content Include="png\**" CopyToOutputDirectory="PreserveNewest" />
+
+    <!-- Lucide icon set used by the report's chips, rings and section headings.
+         Same source the design template drew from, so an icon here is the icon
+         the approved layout shows. -->
+    <Content Include="icons\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
