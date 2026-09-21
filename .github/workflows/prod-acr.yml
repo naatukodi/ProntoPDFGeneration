@@ -1,0 +1,101 @@
+name: Build, push and deploy production PDF image
+
+on:
+  push:
+    branches:
+      - Prod
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: prod-pdf
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Must match the Azure federated identity credential
+    # (repo:naatukodi/ProntoPDFGeneration:environment:Production).
+    environment: Production
+    env:
+      # The github-azure-deploy app registration and the vehgaprod subscription.
+      # These are identifiers, not secrets: only this repo's Production
+      # environment can sign in with them, through the federated credential.
+      AZURE_CLIENT_ID: ce8981af-1da5-4a4b-9805-69f36cf53f0d
+      AZURE_TENANT_ID: c157d1c3-9a34-407a-9856-2f4b906c380b
+      AZURE_SUBSCRIPTION_ID: ad619a86-1e38-492a-8a83-668bd81053f4
+      # Registry name without .azurecr.io. The Azure identity needs push access.
+      ACR_NAME: vehgaacr
+      ACR_LOGIN_SERVER: vehgaacr.azurecr.io
+      IMAGE_NAME: valuation-pdf
+      # The production PDF app. The Azure identity needs Website Contributor on it.
+      RESOURCE_GROUP: vehgaprod
+      WEBAPP_NAME: vehgapdf
+      SMOKE_URL: https://vehgapdf-c4hrbehgauf8gtez.centralindia-01.azurewebsites.net/swagger/v1/swagger.json
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign in to Azure Container Registry
+        shell: bash
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # .dockerignore keeps bin/, obj/ and every appsettings*.json out of the
+      # image; the app reads its settings from the App Service instead.
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:prod
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # vehgapdf is pinned to an exact image, so a new push changes nothing
+      # until this points it at the new tag. The image is pulled with the app's
+      # managed identity; stop if that has been switched off.
+      - name: Point vehgapdf at the new image
+        shell: bash
+        run: |
+          az webapp config set \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$WEBAPP_NAME" \
+            --linux-fx-version "DOCKER|$ACR_LOGIN_SERVER/$IMAGE_NAME:${{ github.sha }}" \
+            --output none
+          uses_identity=$(az webapp config show --resource-group "$RESOURCE_GROUP" --name "$WEBAPP_NAME" \
+            --query acrUseManagedIdentityCreds --output tsv)
+          if [ "$uses_identity" != "true" ]; then
+            echo "::error::$WEBAPP_NAME no longer pulls with its managed identity; the new image cannot be pulled."
+            exit 1
+          fi
+
+      - name: Wait for vehgapdf to answer
+        shell: bash
+        run: |
+          sleep 45
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$SMOKE_URL" || true)
+            if [ "$code" = "200" ]; then echo "vehgapdf is serving (HTTP 200)"; exit 0; fi
+            echo "attempt $i: HTTP $code"
+            sleep 20
+          done
+          echo "::error::vehgapdf did not answer 200 within about 11 minutes"
+          exit 1
