@@ -29,22 +29,24 @@ namespace Valuation.Api.Services
         {
             try
             {
-                using var original = SKBitmap.Decode(imageBytes);
-                if (original == null) return imageBytes;
+                using var originalBitmap = SKBitmap.Decode(imageBytes);
+                if (originalBitmap == null) return imageBytes;
 
-                int cropW = original.Width, cropH = (int)(original.Width / aspect);
-                if (cropH > original.Height)
+                int cropW = originalBitmap.Width, cropH = (int)(originalBitmap.Width / aspect);
+                if (cropH > originalBitmap.Height)
                 {
-                    cropH = original.Height;
-                    cropW = (int)(original.Height * aspect);
+                    cropH = originalBitmap.Height;
+                    cropW = (int)(originalBitmap.Height * aspect);
                 }
-                int x = (original.Width - cropW) / 2;
-                int y = (original.Height - cropH) / 2;
+                
+                int x = (originalBitmap.Width - cropW) / 2;
+                int y = (originalBitmap.Height - cropH) / 2;
+                var cropRect = new SKRectI(x, y, x + cropW, y + cropH);
 
-                using var cropped = new SKBitmap(cropW, cropH);
-                original.ExtractSubset(cropped, new SKRectI(x, y, x + cropW, y + cropH));
-                using var image = SKImage.FromBitmap(cropped);
-                using var data = image.Encode(SKEncodedImageFormat.Jpeg, 92);
+                using var originalImage = SKImage.FromBitmap(originalBitmap);
+                using var subsetImage = originalImage.Subset(cropRect);
+                using var data = subsetImage.Encode(SKEncodedImageFormat.Jpeg, 92);
+                
                 return data.ToArray();
             }
             catch { return imageBytes; }
@@ -93,7 +95,11 @@ namespace Valuation.Api.Services
                         {
                             r.RelativeItem().Element(x => VahanRow(x, rows[i]));
                             r.ConstantItem(Mm(6));
-                            r.RelativeItem().Element(x => VahanRow(x, rows[i + 1]));
+                            
+                            if (i + 1 < rows.Length)
+                                r.RelativeItem().Element(x => VahanRow(x, rows[i + 1]));
+                            else
+                                r.RelativeItem(); // prevents crash if row count becomes odd
                         });
                     }
 
@@ -121,21 +127,30 @@ namespace Valuation.Api.Services
                 string.IsNullOrWhiteSpace(vd?.InsurancePolicyNo) ? null : $"Policy: {vd!.InsurancePolicyNo}",
             }.Where(x => x != null)!);
 
+            var financierLine = lien 
+                ? (string.IsNullOrWhiteSpace(vd?.Lender) ? "Lien detected" : vd!.Lender) 
+                : "No lien on record";
+
             var cards = new (string Icon, string Name, string? Sub, string Tone, string Pill, string? Exp)[]
             {
                 ("shield-check", "COMPREHENSIVE INSURANCE", insurerLine,
                  ins.Warn ? "avg" : "good", ins.Status, ins.Expiry),
-                ("landmark", "HYPOTHECATION (STATUS)", lien ? "Lien detected" : "No lien on record",
-                 lien ? "avg" : "good", lien ? "LIEN" : "NONE", null),
+                 
+                ("landmark", "HYPOTHECATION (STATUS)", financierLine,
+                 lien ? "avg" : "good", lien ? "YES" : "NO", null),
+                 
                 ("file-badge", "NATIONAL PERMIT",
                  permit.Status == "---" ? "Not available on record" : vd?.PermitType,
                  permit.Warn ? "avg" : "good", permit.Status == "---" ? "NOT FOUND" : permit.Status,
                  permit.Status == "---" ? null : permit.Expiry),
+                 
                 ("badge-check", "FITNESS CERTIFICATE", null,
                  fit.Warn ? "avg" : "good", fit.Status == "---" ? "NOT FOUND" : fit.Status,
                  fit.Status == "---" ? null : fit.Expiry),
+                 
                 ("receipt-text", "TAX VALIDITY", "Road tax / LTT status",
                  tax.Warn ? "avg" : "good", tax.Status, string.IsNullOrWhiteSpace(tax.Expiry) ? null : tax.Expiry),
+                 
                 // "(PUCC)" dropped from the title only because it wrapped to a second
                 // line, which none of the other five cards do. The subtitle carries the
                 // certificate number.
