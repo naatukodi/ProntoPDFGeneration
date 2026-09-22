@@ -108,26 +108,28 @@ namespace Valuation.Api.Services
             // identification shots make the third row and the tyres start the next page.
             int lifted = 0;
 
-            // Photos on the last page give up to 10mm each when that lets the disclaimer
-            // come up too, rather than leave it alone on a page of its own.
-            const double DisclaimerSqueezeMm = -10;
-            double MinStretch(int lift) => lift == closing.Count ? DisclaimerSqueezeMm : 0;
-
             List<ClosingPart> Rest() => closing.Skip(lifted).ToList();
             // A disclaimer left over on its own does not open with the photo heading or
             // count as a photo page. With no gallery at all the heading stays, as before.
             bool ClosingHeading() => Rest().Any(p => p != ClosingPart.Disclaimer) || galleryPages == 0;
             int PhotoPages() => galleryPages + (Rest().Count > 0 && ClosingHeading() ? 1 : 0);
 
+            // Photos are a fixed 91 x 66mm — 4:3 near enough, the approved size. They used
+            // to grow to fill the page (to 74.5mm, 1.22:1), which trimmed the sides off
+            // every shot, and shrink to 56mm to make room for the disclaimer; a 16:9 GPS
+            // camera shot lost its watermark's edges both ways. A page that does not fill
+            // ends in white above the footer instead.
+            const double GalleryPanelMm = 66;
+
             void GalleryPage(IContainer container, List<(string Label, byte[]? Image)> slice,
-                             int lift, double extra, bool measuring, string tag)
+                             int lift, bool measuring, string tag)
             {
                 container.Column(col =>
                 {
                     DrawSectionHeading(col.Item().PaddingBottom(Mm(3)), "camera", "Photographic Evidence", tag);
-                    PhotoGrid(col, slice, 66 + extra, measuring);
+                    PhotoGrid(col, slice, GalleryPanelMm, measuring);
                     ClosingParts(col, closing.Take(lift).ToList(), afterPhotos: true,
-                                 chassisId, tyres, tyreH, 66 + extra, measuring);
+                                 chassisId, tyres, tyreH, GalleryPanelMm, measuring);
                 });
             }
 
@@ -140,7 +142,7 @@ namespace Valuation.Api.Services
                     float width = ctx.AvailableSize.Width;
                     float room = ctx.AvailableSize.Height - 0.5f;
                     bool Fits(int lift) => ctx.CreateElement(c =>
-                            GalleryPage(c.Width(width), lastSlice, lift, MinStretch(lift), true, "0 / 0"))
+                            GalleryPage(c.Width(width), lastSlice, lift, true, "0 / 0"))
                         .Size.Height <= room;
                     while (lifted < closing.Count && Fits(lifted + 1)) lifted++;
 
@@ -159,29 +161,24 @@ namespace Valuation.Api.Services
                 bool last = pageNo == galleryPages;
                 var slice = walkAround.Skip((pageNo - 1) * PhotosPerPage).Take(PhotosPerPage).ToList();
 
-                // The photos grow from 66mm until the page is full — three rows of 66mm
-                // left 28mm of white above the footer. Capped at a square panel: past that
-                // a 4:3 photo loses more of its sides than it gains in height.
-                main.Item().Dynamic(new FillPage((page, extra, measuring) =>
-                        GalleryPage(page, slice, last ? lifted : 0, extra, measuring, $"{thisPage} / {PhotoPages()}"),
-                    maxMm: HalfColumnMm - 66,
-                    // Lazily: the floor follows the plan, which is only made once the
-                    // first gallery page is laid out — read here it would always be 0.
-                    minMm: () => last ? MinStretch(lifted) : 0));
+                // Nothing stretches (maxMm 0): the fill is kept for its replay of the
+                // layout decision, and so the lifted closing parts are composed lazily.
+                main.Item().Dynamic(new FillPage((page, _, measuring) =>
+                        GalleryPage(page, slice, last ? lifted : 0, measuring, $"{thisPage} / {PhotoPages()}"),
+                    maxMm: 0));
             }
 
             // ---------- closing page: whatever did not fit under the last photos
             //
-            // Here the identification shots are what grows. Capped at 90mm: they are
-            // cropped to their panel, and a chassis number runs across the frame, so a
-            // much taller panel would start trimming characters off its ends.
-            main.Item().Dynamic(new FillPage((page, extra, measuring) => page.Column(col =>
+            // The identification shots keep their approved 91 x 68mm (4:3). They grew to
+            // fill this page too, up to 90mm, cropping the sides off a chassis number.
+            main.Item().Dynamic(new FillPage((page, _, measuring) => page.Column(col =>
                 {
                     if (ClosingHeading())
                         DrawSectionHeading(col.Item().PaddingBottom(Mm(3)), "camera",
                                            "Photographic Evidence", $"{PhotoPages()} / {PhotoPages()}");
-                    ClosingParts(col, Rest(), afterPhotos: false, chassisId, tyres, tyreH, 68 + extra, measuring);
-                }), maxMm: 22)
+                    ClosingParts(col, Rest(), afterPhotos: false, chassisId, tyres, tyreH, 68, measuring);
+                }), maxMm: 0)
             {
                 OwnPage = true,
                 Present = () => Rest().Count > 0,

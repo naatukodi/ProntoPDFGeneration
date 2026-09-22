@@ -371,8 +371,11 @@ namespace Valuation.Api.Services
 
             var ident = new (string Icon, string Label, string? Value)[]
             {
-                ("user",         "OWNER",            vd?.OwnerName),
-                ("user-check",   "APPLICANT",        doc.Stakeholder?.Applicant?.Name),
+                // Names upper-cased like every other value here: the applicant is printed
+                // as typed on the stakeholder page ("B Prabhakar Reddy"), and VAHAN
+                // sometimes returns the owner in mixed case too ("Ch Arun Kumar").
+                ("user",         "OWNER",            vd?.OwnerName?.Trim().ToUpperInvariant()),
+                ("user-check",   "APPLICANT",        doc.Stakeholder?.Applicant?.Name?.Trim().ToUpperInvariant()),
                 ("shield-check", "CHASSIS NUMBER",   vd?.ChassisNumber),
                 ("cog",          "ENGINE NUMBER",    vd?.EngineNumber),
                 ("calendar",     "MANUFACTURE YEAR", ResolveMfgYear(vd)),
