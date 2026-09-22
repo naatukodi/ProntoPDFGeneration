@@ -57,6 +57,8 @@ public class ValuationDocument
 public class Stakeholder
 {
     public string? Name { get; set; }
+    /// <summary>The client's branch, from the stakeholder page (optional there).</summary>
+    public string? Branch { get; set; }
     public string? ExecutiveName { get; set; }
     public string? ExecutiveContact { get; set; }
     public string? ExecutiveWhatsapp { get; set; }

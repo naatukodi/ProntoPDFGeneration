@@ -290,11 +290,15 @@ namespace Valuation.Api.Services
                 l.Layer().Svg(s => RoundRect(s.Width, s.Height, Mm(2.6), "#FFFFFF", Border));
                 l.PrimaryLayer().Row(r =>
                 {
+                    // BRANCH is the client's branch from the stakeholder page; PLACE OF
+                    // INSPECTION is where the AVO inspected it, from the AVO page. BRANCH
+                    // used to print the inspection location as well, so both boxes always
+                    // read the same.
                     var place = ins?.InspectionLocation?.ToUpperInvariant();
                     var cells = new (string Icon, string Label, string? Value)[]
                     {
                         ("building-2", "CLIENT",              doc.Stakeholder?.Name?.ToUpperInvariant()),
-                        ("map-pin",    "BRANCH",              place),
+                        ("map-pin",    "BRANCH",              doc.Stakeholder?.Branch?.Trim().ToUpperInvariant()),
                         ("calendar",   "DATE OF INSPECTION",  ins?.DateOfInspection?.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)),
                         ("map-pin",    "PLACE OF INSPECTION", place),
                     };
@@ -353,7 +357,7 @@ namespace Valuation.Api.Services
                      $"RC status: {Capitalise(ResolveRcStatus(vd) ?? "-")}", Teal, "#FFFFFF");
                 r.ConstantItem(Mm(2.4));
 
-                Fact("Hypothecation", lien ? "Lien detected" : "No lien",
+                Fact("Hypothecation", lien ? "Yes" : "No",
                      lien ? "Verify closure / NOC" : "No charge on record",
                      lien ? RingAmber : RingGreen, lien ? "#FFFBF1" : "#FFFFFF");
                 r.ConstantItem(Mm(2.4));
