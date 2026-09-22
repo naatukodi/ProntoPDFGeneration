@@ -139,8 +139,7 @@ namespace Valuation.Api.Services
         private sealed class FillPage : IDynamicComponent
         {
             private readonly Action<IContainer, double, bool> _compose;
-            private readonly Func<double> _minOf;
-            private readonly double _max;
+            private readonly double _min, _max;
 
             /// <summary>Starts the block on a page of its own: offered anything less than a
             /// fresh page, it defers to the next one. Stands in for a PageBreak where
@@ -154,15 +153,10 @@ namespace Valuation.Api.Services
             /// while measuring, so images can be stood in for by same-sized placeholders
             /// instead of being decoded and cropped at every step of the search.</param>
             public FillPage(Action<IContainer, double, bool> compose, double maxMm, double minMm = 0)
-                : this(compose, maxMm, () => minMm) { }
-
-            /// <param name="minMm">Read at layout time, not when the block is built: for a
-            /// floor that depends on a decision taken while earlier pages were laid out.</param>
-            public FillPage(Action<IContainer, double, bool> compose, double maxMm, Func<double> minMm)
             {
                 _compose = compose;
                 _max = maxMm;
-                _minOf = minMm;
+                _min = minMm;
             }
 
             /// <summary>
@@ -220,7 +214,6 @@ namespace Valuation.Api.Services
                         HasMoreContent = true,
                     };
 
-                double _min = _minOf();
                 float target = offered - HeadroomPt;
                 double gap = BottomGapMm;
                 float Height(double s) =>
