@@ -165,7 +165,10 @@ namespace Valuation.Api.Services
             for (int i = 0; i < cards.Length; i += 2)
             {
                 if (i > 0) main.Item().Height(Mm(4));
-                main.Item().Row(r =>
+                // Whole rows only. A row that lands too near the foot of the page moves to
+                // the next one intact; QuestPDF would otherwise split it, and a card torn
+                // in two strands its last line alone at the top of a page.
+                main.Item().ShowEntire().Row(r =>
                 {
                     r.RelativeItem().Element(x => RegulatoryCard(x, cards[i]));
                     r.ConstantItem(Mm(4));
@@ -253,7 +256,12 @@ namespace Valuation.Api.Services
             (string Icon, string Name, string? Sub, string Tone, string Pill, string? Exp) card)
         {
             var edge = card.Tone == "good" ? RingGreen : RingAmber;
-            container.Height(Mm(19)).Layers(l =>
+            // 19mm is a floor, not a fixed height. A title that wraps -- COMPREHENSIVE
+            // INSURANCE beside the wider ON RECORD pill does -- makes the card ~1mm taller
+            // than that, and a fixed Height() does not clip in QuestPDF: it continued the
+            // card on the next page (PM-758104-K: page 2 half empty, "Policy: …" alone on
+            // page 3). The Row hands both cards of a pair its full height, so they stay level.
+            container.MinHeight(Mm(19)).Layers(l =>
             {
                 l.Layer().Svg(s => LeftBarCard(s.Width, s.Height, Mm(2.6), Mm(1.3), edge, "#FFFFFF", Border));
                 l.PrimaryLayer().PaddingVertical(Mm(2.8)).PaddingLeft(Mm(3.6)).PaddingRight(Mm(3.6)).Row(r =>
