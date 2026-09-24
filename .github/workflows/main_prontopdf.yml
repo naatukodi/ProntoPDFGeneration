@@ -3,10 +3,12 @@
 
 name: Build and deploy ASP.Net Core app to Azure Web App - prontopdf
 
+# prontopdf is the OLD app. Production moved to vehgapdf on 2026-09-22 (see
+# prod-acr.yml, which deploys from the Prod branch), and prontopdf is stopped.
+# A push deploy would restart it, so main no longer deploys: it is the review
+# step before Prod. Start this by hand only, or restore the push trigger when
+# the old app comes back as staging.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:

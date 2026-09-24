@@ -91,21 +91,23 @@ namespace Valuation.Api.Services
             // would otherwise repeat that at each step of its search.
             double tyreH = tyres.Count > 0 ? TyrePanelHeightMm(tyres, 43.5) : 0;
 
-            // The closing material, in the order it reads.
+            // The identification shots close the gallery, and they are photographs like
+            // any other, so they continue the grid instead of starting a row of their own.
+            // On AP39X8199 the last page held five photos and the chassis number went to a
+            // page of its own, leaving the half beside the selfie empty.
+            var gallery = walkAround.Concat(chassisId).ToList();
+
+            // What follows the photographs, in the order it reads.
             var closing = new List<ClosingPart>();
-            if (chassisId.Count > 0) closing.Add(ClosingPart.Identification);
             if (tyres.Count > 0) closing.Add(ClosingPart.Tyres);
             closing.Add(ClosingPart.Disclaimer);
 
-            int galleryPages = (walkAround.Count + PhotosPerPage - 1) / PhotosPerPage;
-            var lastSlice = walkAround.Skip(Math.Max(0, galleryPages - 1) * PhotosPerPage).ToList();
+            int galleryPages = (gallery.Count + PhotosPerPage - 1) / PhotosPerPage;
+            var lastSlice = gallery.Skip(Math.Max(0, galleryPages - 1) * PhotosPerPage).ToList();
 
-            // How many closing parts ride up onto the last gallery page, from the front.
-            // A last page holding one row of photos left ~156mm of white above the
-            // footer, with the identification shots and tyres alone on the page after.
-            // Now they fill it: under one row, the identification shots, the tyres and
-            // (room permitting) the disclaimer come up; under two rows, the
-            // identification shots make the third row and the tyres start the next page.
+            // How many closing parts ride up onto the last gallery page, from the front:
+            // a last page holding one row of photos used to leave ~156mm of white above
+            // the footer, with the tyres alone on the page after.
             int lifted = 0;
 
             List<ClosingPart> Rest() => closing.Skip(lifted).ToList();
@@ -129,7 +131,7 @@ namespace Valuation.Api.Services
                     DrawSectionHeading(col.Item().PaddingBottom(Mm(3)), "camera", "Photographic Evidence", tag);
                     PhotoGrid(col, slice, GalleryPanelMm, measuring);
                     ClosingParts(col, closing.Take(lift).ToList(), afterPhotos: true,
-                                 chassisId, tyres, tyreH, GalleryPanelMm, measuring);
+                                 tyres, tyreH, measuring);
                 });
             }
 
@@ -159,7 +161,7 @@ namespace Valuation.Api.Services
                 if (pageNo > 1) main.Item().PageBreak();
                 int thisPage = pageNo;
                 bool last = pageNo == galleryPages;
-                var slice = walkAround.Skip((pageNo - 1) * PhotosPerPage).Take(PhotosPerPage).ToList();
+                var slice = gallery.Skip((pageNo - 1) * PhotosPerPage).Take(PhotosPerPage).ToList();
 
                 // Nothing stretches (maxMm 0): the fill is kept for its replay of the
                 // layout decision, and so the lifted closing parts are composed lazily.
@@ -169,15 +171,12 @@ namespace Valuation.Api.Services
             }
 
             // ---------- closing page: whatever did not fit under the last photos
-            //
-            // The identification shots keep their approved 91 x 68mm (4:3). They grew to
-            // fill this page too, up to 90mm, cropping the sides off a chassis number.
             main.Item().Dynamic(new FillPage((page, _, measuring) => page.Column(col =>
                 {
                     if (ClosingHeading())
                         DrawSectionHeading(col.Item().PaddingBottom(Mm(3)), "camera",
                                            "Photographic Evidence", $"{PhotoPages()} / {PhotoPages()}");
-                    ClosingParts(col, Rest(), afterPhotos: false, chassisId, tyres, tyreH, 68, measuring);
+                    ClosingParts(col, Rest(), afterPhotos: false, tyres, tyreH, measuring);
                 }), maxMm: 0)
             {
                 OwnPage = true,
@@ -210,40 +209,21 @@ namespace Valuation.Api.Services
             }
         }
 
-        private enum ClosingPart { Identification, Tyres, Disclaimer }
+        private enum ClosingPart { Tyres, Disclaimer }
 
         /// <summary>
-        /// The report's closing material — the identification shots, the tyres, the
-        /// disclaimer — or the part of it given. <paramref name="afterPhotos"/> says it
-        /// continues a gallery page, so the first part is spaced off the grid above.
+        /// What follows the photographs — the tyres, the disclaimer — or the part of it
+        /// given. <paramref name="afterPhotos"/> says it continues a gallery page, so the
+        /// first part is spaced off the grid above.
         /// </summary>
         private void ClosingParts(ColumnDescriptor col, List<ClosingPart> parts, bool afterPhotos,
-                                  List<(string Label, byte[]? Image)> chassisId, List<byte[]> tyres,
-                                  double tyreH, double idPanelMm, bool measuring)
+                                  List<byte[]> tyres, double tyreH, bool measuring)
         {
             bool first = !afterPhotos;
             foreach (var part in parts)
             {
                 switch (part)
                 {
-                    case ClosingPart.Identification:
-                        // Spaced as one more row of the grid when it follows one.
-                        col.Item().PaddingTop(first ? 0 : Mm(3.6)).Row(row =>
-                        {
-                            for (int c = 0; c < 2; c++)
-                            {
-                                if (c > 0) row.ConstantItem(Mm(4));
-                                if (c < chassisId.Count)
-                                {
-                                    var item = chassisId[c];
-                                    row.RelativeItem().Element(x =>
-                                        LabelledPhoto(x, item.Image!, item.Label, HalfColumnMm, idPanelMm, measuring: measuring));
-                                }
-                                else row.RelativeItem();
-                            }
-                        });
-                        break;
-
                     case ClosingPart.Tyres:
                         // The template's tyre panels are 74mm tall because its sample shots
                         // were portrait. Real AVO tyre photos are landscape 4:3, and
