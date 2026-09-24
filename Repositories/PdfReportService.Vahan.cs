@@ -192,16 +192,25 @@ namespace Valuation.Api.Services
                 .ToList();
             if (present.Count == 0) return;
 
-            // The two strips are the page's last block, so they take whatever is left
-            // above the footer — about 10mm on a typical case, which also makes the
-            // stamped characters easier to read. Both grow by the same amount so they
-            // stay a matching pair. Capped at 30mm: if long addresses push these cards
-            // onto a page of their own, they should not swell to fill that page too.
-            main.Item().Dynamic(new FillPage((block, extra, measuring) => block.Column(col =>
+            // Each strip starts at the height its own photograph asks for, and the crop
+            // follows that height, so the whole width of the photograph survives. They
+            // used to be a flat 14mm grown to fill the page: a stencil trace shot as a
+            // 12.4:1 band was cropped to 10.3:1 and lost the first and last characters of
+            // the chassis number (AP39X8199 printed MAT541170K1C05422 as AT541170K1C054).
+            //
+            // Where page 2 has no room for both at their natural height, they give height
+            // back together — which crops them top and bottom, never at the ends — rather
+            // than moving to a page of their own. Heights are worked out once; the fill
+            // would otherwise decode both photographs at every step of its search.
+            var strips = present.Select(c => (c.Title, c.Image, Natural: StripHeightMm(c.Image))).ToList();
+            double tallest = strips.Max(s => s.Natural);
+
+            main.Item().Dynamic(new FillPage((block, give, measuring) => block.Column(col =>
             {
-                foreach (var (title, img) in present)
-                    col.Item().PaddingTop(Mm(4.5)).Element(x => ChassisCard(x, title, img, 14 + extra, measuring));
-            }), maxMm: 16));
+                foreach (var (title, img, natural) in strips)
+                    col.Item().PaddingTop(Mm(4.5))
+                       .Element(x => ChassisCard(x, title, img, Math.Max(MinStripMm, natural + give), measuring));
+            }), maxMm: 0, minMm: MinStripMm - tallest));
         }
 
         // ──────────────────────────────────────────────
@@ -291,6 +300,30 @@ namespace Valuation.Api.Services
         }
 
         /// <summary>A chassis identification card: title, then the photo strip.</summary>
+        /// <summary>The card's inner width: what a strip's crop is measured against.</summary>
+        private const double ChassisStripWidthMm = 178.8;
+
+        /// <summary>A strip never goes below this, however little room the page has left.</summary>
+        private const double MinStripMm = 8;
+
+        /// <summary>
+        /// The height a chassis strip asks for — the card's inner width over the
+        /// photograph's own shape, so the whole width of the photograph survives the crop.
+        /// Capped at 26mm, which crops a 4:3 photo of the chassis area down to a band, as
+        /// the template intends; cropping at that point only takes off the top and bottom.
+        /// </summary>
+        private static double StripHeightMm(byte[] image)
+        {
+            try
+            {
+                using var bmp = SKBitmap.Decode(image);
+                if (bmp is { Width: > 0, Height: > 0 })
+                    return Math.Clamp(ChassisStripWidthMm * bmp.Height / bmp.Width, MinStripMm, 26);
+            }
+            catch { /* unreadable frame keeps the template's own band */ }
+            return 14;
+        }
+
         private void ChassisCard(IContainer container, string title, byte[] image,
                                  double stripMm, bool measuring)
         {
@@ -312,15 +345,13 @@ namespace Valuation.Api.Services
                         });
                     });
 
-                    // At least 14mm, near the ~11mm band the template's own strips occupy;
-                    // FillPage grows it into whatever the page has left. The crop follows
-                    // the strip's actual shape — 178.8mm is the card's inner width.
+                    // The crop follows the strip's shape, which follows the photo's.
                     c.Item().Height(Mm(stripMm)).Layers(img =>
                     {
                         img.PrimaryLayer().Element(x =>
                         {
                             if (measuring) return;   // only its height matters while measuring
-                            x.Image(CropToAspect(image, (float)(178.8 / stripMm))).FitUnproportionally();
+                            x.Image(CropToAspect(image, (float)(ChassisStripWidthMm / stripMm))).FitUnproportionally();
                         });
                         img.Layer().Svg(s => RoundedPhotoMask(s.Width, s.Height, Mm(1.6), Border));
                     });
