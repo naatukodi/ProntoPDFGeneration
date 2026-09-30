@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using QuestPDF.Elements;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
 using QuestPDF.Infrastructure;
@@ -514,11 +517,8 @@ namespace Valuation.Api.Services
                         c.Item().Text("REMARKS")
                             .FontFamily(ReportFont).FontSize(6.6f).Bold().FontColor(Orange)
                             .LetterSpacing(Ls(0.25, 6.6));
-                        var (remarkText, remarkPt) =
-                            RemarksStyle(doc.QualityControl?.Remarks ?? "Vehicle found in good road worthy condition.");
-                        c.Item().PaddingTop(Mm(1.2))
-                            .Text($"“{remarkText}”")
-                            .FontFamily(ReportFont).FontSize(remarkPt).Italic().FontColor(InkSoft).LineHeight(1.35f);
+                        c.Item().PaddingTop(Mm(1.2)).Dynamic(new RemarkText(
+                            doc.QualityControl?.Remarks ?? "Vehicle found in good road worthy condition."));
                     });
                 });
 
@@ -568,7 +568,8 @@ namespace Valuation.Api.Services
         /// specified 8.6pt across the 80mm text column, so longer remarks step down a
         /// size before anything is cut, and only a remark beyond about 330 characters
         /// is truncated. QC remarks are usually a sentence; this is for the ones that
-        /// are not.
+        /// are not. Length alone cannot see a remark that is short but many lines tall;
+        /// <see cref="RemarkText"/> handles those.
         /// </summary>
         private static (string Text, float FontSize) RemarksStyle(string remarks)
         {
@@ -578,6 +579,144 @@ namespace Valuation.Api.Services
             if (text.Length <= 330) return (text, 6.6f);
             return (text[..327].TrimEnd() + "…", 6.6f);
         }
+
+        /// <summary>Smallest size a remark is printed at with the QC's own line breaks.
+        /// Below it the lines are joined into a paragraph, which fits far larger.</summary>
+        private const float MinRemarkPt = 6f;
+
+        /// <summary>
+        /// The remark, in whatever room its box has left under the label — measured, not
+        /// estimated from its length.
+        ///
+        /// As typed if that fits at <see cref="MinRemarkPt"/> or more, at the largest size
+        /// up to its <see cref="RemarksStyle"/> size; otherwise joined into one paragraph
+        /// (<see cref="JoinRemarkLines"/>). A QC remark typed as six short lines
+        /// (TS26T9993, 2026-09-30) is 131 characters, well inside the 8.6pt tier, but
+        /// needed a ~35mm box where the cover had ~27mm. The box is a fixed height inside
+        /// a <see cref="FillPage"/>, and text past a fixed height is a partial render that
+        /// FillPage's height test reads as a fit: it handed QuestPDF a block that did not
+        /// fit, and the whole report threw. So the text is never allowed past the room.
+        ///
+        /// The block always takes the full room it is offered. The draw pass offers
+        /// exactly the height layout measured; returning less would have it re-decide
+        /// against a smaller room and print a smaller size than layout chose.
+        /// </summary>
+        private sealed class RemarkText : IDynamicComponent
+        {
+            private const float HeadroomPt = 0.5f;
+            private readonly string _typed, _joined;
+            private readonly float _typedPt, _joinedPt;
+
+            public RemarkText(string remarks)
+            {
+                // Blank lines and runs of spaces cost room and say nothing.
+                var lines = remarks.Split('\n')
+                    .Select(line => string.Join(' ', line.Split(new[] { ' ', '\t', '\r' },
+                                                                StringSplitOptions.RemoveEmptyEntries)))
+                    .Where(line => line.Length > 0)
+                    .ToList();
+                (_typed, _typedPt)   = RemarksStyle(string.Join("\n", lines));
+                (_joined, _joinedPt) = RemarksStyle(JoinRemarkLines(lines));
+                _typed  = $"“{_typed}”";
+                _joined = $"“{_joined}”";
+            }
+
+            public DynamicComponentComposeResult Compose(DynamicContext context)
+            {
+                // Pinned to the real width, as in FillPage: CreateElement measures unbounded.
+                float width = context.AvailableSize.Width;
+                float room  = context.AvailableSize.Height;
+
+                float Height(string text, float pt) =>
+                    context.CreateElement(c => Draw(c.Width(width), text, pt)).Size.Height;
+                bool Fits(string text, float pt) => Height(text, pt) <= room - HeadroomPt;
+
+                // QuestPDF may break a line straight after a slash, which printed "N/" at
+                // the end of one line and "A”" alone on the next. Where a slashed word
+                // would end a line below the one it starts on, the space before it becomes
+                // the line break instead. Measured from the word's first letter, not from
+                // the slash: "N/" set at the end of a cut-off prefix loses the "/A" kerning
+                // and measures wider than it does in the sentence. A word the engine would
+                // have moved down whole anyway looks the same here, and breaking before it
+                // changes nothing. The space keeps its place in the string, so later words
+                // are found where the first scan found them.
+                string KeepSlashWordsWhole(string text, float pt)
+                {
+                    var chars = text.ToCharArray();
+                    foreach (Match word in SlashWord.Matches(text))
+                    {
+                        if (word.Index == 0 || chars[word.Index - 1] != ' ') continue;
+                        var now = new string(chars);
+                        if (Height(now[..(word.Index + 1)], pt) + 1 >= Height(now[..(word.Index + word.Length)], pt))
+                            continue;
+                        chars[word.Index - 1] = '\n';
+                        if (!Fits(new string(chars), pt)) chars[word.Index - 1] = ' ';
+                    }
+                    return new string(chars);
+                }
+
+                // The largest size in [min, max] that fits, or null if even min does not.
+                float? Largest(string text, float max, float min)
+                {
+                    if (Fits(text, max)) return max;
+                    if (!Fits(text, min)) return null;
+                    for (int i = 0; i < 8; i++)
+                    {
+                        float mid = (min + max) / 2;
+                        if (Fits(text, mid)) min = mid; else max = mid;
+                    }
+                    return min;
+                }
+
+                var (text, pt) = Largest(_typed, _typedPt, MinRemarkPt) is { } typedPt
+                    ? (_typed, typedPt)
+                    : (_joined, Largest(_joined, _joinedPt, MinRemarkPt) ?? MinRemarkPt);
+                text = KeepSlashWordsWhole(text, pt);
+
+                return new DynamicComponentComposeResult
+                {
+                    // ScaleToFit only ever acts on a joined remark that will not fit at the
+                    // floor, which RemarksStyle's cut rules out in a 25mm box — but a remark
+                    // must never be what takes the report down.
+                    Content = context.CreateElement(c =>
+                        Draw(c.Width(width).Height(room).ScaleToFit(), text, pt)),
+                    HasMoreContent = false,
+                };
+            }
+
+            private static void Draw(IContainer c, string quoted, float pt) =>
+                c.Text(quoted)
+                    .FontFamily(ReportFont).FontSize(pt).Italic().FontColor(InkSoft).LineHeight(1.35f);
+
+            /// <summary>A word with a slash inside it: "N/A", "and/or".</summary>
+            private static readonly Regex SlashWord = new(@"\S+/\S+", RegexOptions.Compiled);
+        }
+
+        /// <summary>
+        /// A remark typed over several lines, as one paragraph. A line starting a new
+        /// numbered point ("2." or "2)") is set off with a comma; a line carrying on the
+        /// one before — "Accidental Status -" then "No" — joins with a space, as does
+        /// any line after punctuation. Unnumbered, a line in lower case carries on the
+        /// one before and any other starts a new point.
+        /// </summary>
+        private static string JoinRemarkLines(IReadOnlyList<string> lines)
+        {
+            bool numbered = lines.Any(l => NumberedPoint.IsMatch(l));
+            var text = new StringBuilder();
+            foreach (var line in lines)
+            {
+                if (text.Length > 0)
+                {
+                    bool newPoint = numbered ? NumberedPoint.IsMatch(line) : !char.IsLower(line[0]);
+                    text.Append(newPoint && ",;:.-–—!?".IndexOf(text[^1]) < 0 ? ", " : " ");
+                }
+                text.Append(line);
+            }
+            return text.ToString();
+        }
+
+        /// <summary>"1." / "12)" at the start of a line — not "2.5 lakh".</summary>
+        private static readonly Regex NumberedPoint = new(@"^\d{1,2}\s*[.)](?!\d)", RegexOptions.Compiled);
 
         /// <summary>
         /// How large the market value can be set.
