@@ -302,9 +302,6 @@ namespace Valuation.Api.Services
             _      => ("#F8FAFC", "#E2E8F0", "#E2E8F0", "#64748B", "#475569"),   // neutral
         };
 
-        /// <summary>The small caption above a check card's verdict.</summary>
-        private const string CheckLabelInk = "#5B6470";
-
         // ──────────────────────────────────────────────
         // Icons
         // ──────────────────────────────────────────────
