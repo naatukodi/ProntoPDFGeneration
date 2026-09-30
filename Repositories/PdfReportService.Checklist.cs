@@ -109,20 +109,21 @@ namespace Valuation.Api.Services
             var grouped = GroupedSections(doc, out var all);
             var (cats, overall) = CoverScores(doc);
             var vk = ResolveVehicleTypeKey(doc);
+            var additional = IsTvsCredit(doc) ? AdditionalDetails(doc) : null;
 
             // The whole page is one block that FillPage grows: every question row gains
             // the same extra height until OTHER SYSTEMS reaches the footer — a CV left
             // about 25mm of white there. Floor of -0.5mm per row: only a checklist that
             // would not otherwise fit is ever tightened, and only by that much.
             main.Item().Dynamic(new FillPage((page, rowExtra, _) => page.Column(body =>
-                ChecklistBody(body, ins, grouped, all, cats, overall, vk, rowExtra)),
+                ChecklistBody(body, ins, grouped, all, cats, overall, vk, rowExtra, additional)),
                 maxMm: 2.0, minMm: -0.5));
         }
 
         private void ChecklistBody(ColumnDescriptor main, InspectionDetails ins,
                                    Dictionary<string, List<SectionDef>> grouped, SectionDef[] all,
                                    Dictionary<string, double> cats, double overall, string vk,
-                                   double rowExtra)
+                                   double rowExtra, List<AdditionalItem>? additional)
         {
             // ---------- banner
             main.Item().PaddingBottom(Mm(3.4)).Layers(l =>
@@ -206,6 +207,116 @@ namespace Valuation.Api.Services
                 main.Item().PaddingTop(i > 0 ? Mm(3.2) : 0)
                     .Element(c => WideSection(c, sec.Name, icon, sec, ins, rowExtra));
             }
+
+            if (additional != null)
+                main.Item().PaddingTop(wide.Count > 0 ? Mm(3.2) : 0)
+                    .Element(c => AdditionalDetailsSection(c, additional, rowExtra));
+        }
+
+        // ──────────────────────────────────────────────
+        // Additional details (TVS Credit only)
+        // ──────────────────────────────────────────────
+        //
+        // TVS Credit wants four facts other clients don't: VIN plate, estimated life
+        // remaining, seizure by another financier, and accident status. QC used to type
+        // them into REMARKS on TVS cases only. Accident status went to the cover, for
+        // every client; the other three print here, and only for TVS Credit
+        // (2026-09-30 notes). The portal asks for them on the same cases.
+
+        /// <summary>
+        /// Whether the client is TVS Credit. Every live TVS case reads "TVS Credit
+        /// Services Limited" (the stakeholder dropdown); the match is looser so "TVS
+        /// Credit Service Ltd" still counts. Keep it the same as isTvsCredit in the
+        /// portal's shared/client-rules.ts.
+        /// </summary>
+        private static bool IsTvsCredit(ValuationDocument doc) =>
+            System.Text.RegularExpressions.Regex.IsMatch(doc.Stakeholder?.Name ?? "", @"\bTVS\s*CREDIT\b",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        /// <summary>What a missing VIN plate prints, in the company's own wording.</summary>
+        private const string VinPlateMissingText =
+            "Not available on the vehicle, whereas chassis number verified physically and found genuine";
+
+        /// <summary>One line of the box. <paramref name="Sentence"/> prints the value as text
+        /// rather than a pill — the missing-VIN wording is far too long for one.</summary>
+        private sealed record AdditionalItem(string Label, string Value, string Tone, bool Sentence = false);
+
+        /// <summary>The three lines, in the order the notes lay them out. NA for anything the
+        /// case predates: those were asked in REMARKS, and still say so there.</summary>
+        private static List<AdditionalItem> AdditionalDetails(ValuationDocument doc)
+        {
+            var ins  = doc.InspectionDetails;
+            var life = doc.VehicleDetails?.EstimatedLifeRemaining;
+            const string Seized = "IS IT A SEIZED VEHICLE OF ANY OTHER FINANCE COMPANY";
+            return new()
+            {
+                ins?.VinPlate switch
+                {
+                    true  => new("VIN PLATE", "AVAILABLE", "good"),
+                    false => new("VIN PLATE", VinPlateMissingText, "neutral", Sentence: true),
+                    null  => new("VIN PLATE", "NA", "na"),
+                },
+                life is int years
+                    ? new("ESTIMATED LIFE REMAINING", years == 1 ? "1 YEAR" : $"{years} YEARS", "neutral")
+                    : new("ESTIMATED LIFE REMAINING", "NA", "na"),
+                ins?.SeizedByOtherFinancier switch
+                {
+                    false => new(Seized, "NO", "good"),
+                    true  => new(Seized, "YES", "poor"),
+                    null  => new(Seized, "NA", "na"),
+                },
+            };
+        }
+
+        /// <summary>
+        /// The box, styled as the unscored cards above it. As the notes draw it: VIN
+        /// plate beside estimated life, the seized question across the full width —
+        /// at 8.2pt it is too long for half.
+        /// </summary>
+        private void AdditionalDetailsSection(IContainer container, List<AdditionalItem> items, double rowExtra)
+        {
+            container.Layers(l =>
+            {
+                l.Layer().Svg(s => RoundRect(s.Width, s.Height, Mm(3), "#FBFCFE", Border));
+                l.PrimaryLayer().Column(c =>
+                {
+                    SectionHeader(c, "ADDITIONAL DETAILS", "info", null);
+                    c.Item().PaddingTop(Mm(1.2)).PaddingBottom(Mm(1.6)).PaddingHorizontal(Mm(2.6)).Column(rows =>
+                    {
+                        rows.Item().Row(r =>
+                        {
+                            r.RelativeItem().Element(x => AdditionalRow(x, items[0], false, rowExtra));
+                            r.ConstantItem(Mm(5));
+                            r.RelativeItem().Element(x => AdditionalRow(x, items[1], false, rowExtra));
+                        });
+                        rows.Item().Element(x => AdditionalRow(x, items[2], true, rowExtra));
+                    });
+                });
+            });
+        }
+
+        /// <summary>A line of the box, spaced as <see cref="ChecklistRow"/> so it grows with the page.</summary>
+        private void AdditionalRow(IContainer container, AdditionalItem item, bool last, double rowExtra)
+        {
+            container.BorderBottom(last ? 0 : 1).BorderColor("#F3F6F9")
+                     .PaddingVertical(Mm(Math.Max(0.1, 0.6 + rowExtra / 2))).PaddingHorizontal(Mm(3)).Row(r =>
+            {
+                if (item.Sentence)
+                {
+                    r.AutoItem().AlignMiddle().Text(item.Label)
+                        .FontFamily(ReportFont).FontSize(8.2f).FontColor(InkSoft)
+                        .LetterSpacing(Ls(0.1, 8.2));
+                    r.ConstantItem(Mm(3));
+                    r.RelativeItem().AlignMiddle().Text(item.Value)
+                        .FontFamily(ReportFont).FontSize(7.2f).Bold().FontColor(Navy).LineHeight(1.1f);
+                    return;
+                }
+                r.RelativeItem().AlignMiddle().Text(item.Label)
+                    .FontFamily(ReportFont).FontSize(8.2f).FontColor(InkSoft)
+                    .LetterSpacing(Ls(0.1, 8.2));
+                r.ConstantItem(Mm(2));
+                r.AutoItem().MinWidth(Mm(12)).AlignMiddle().Element(x => CentredPill(x, item.Value, item.Tone));
+            });
         }
 
         // ──────────────────────────────────────────────

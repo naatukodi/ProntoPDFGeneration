@@ -258,7 +258,7 @@ namespace Valuation.Api.Services
                                 c.Item().PaddingBottom(Mm(1.8)).Text("DISCLAIMER")
                                     .FontFamily(ReportFont).FontSize(9.6f).Bold().FontColor(Navy)
                                     .LetterSpacing(Ls(0.5, 9.6));
-                                c.Item().Text(DisclaimerText)
+                                c.Item().Text(DisclaimerText + Theme.LegalNameShort + ".")
                                     .FontFamily(ReportFont).FontSize(8.6f).FontColor(Label)
                                     .LineHeight(1.5f).Justify();
                             });
@@ -279,7 +279,8 @@ namespace Valuation.Api.Services
             "market conditions. Actual realization may vary. This report is issued solely for the use of the " +
             "addressee and shall not be relied upon by any third party. The company shall not be liable for any " +
             "direct, indirect, incidental, or consequential losses arising from reliance on this report. This " +
-            "report is issued without prejudice.";
+            // Closed with the issuing company's name, which depends on the brand.
+            "report is issued without prejudice by ";
 
         /// <summary>
         /// One panel height for the whole tyre row, from the shape of the photos in it.

@@ -13,6 +13,11 @@ namespace Valuation.Api.Models
         public string? EngineStarted { get; set; }
         public long? Odometer { get; set; }
         public bool? VinPlate { get; set; }
+        /// <summary>Accident status from the AVO page, printed on the cover beside DEDUPE.</summary>
+        public bool? Accidental { get; set; }
+        /// <summary>Seized by another finance company. Asked, and printed on page 3, only for
+        /// TVS Credit (see <c>IsTvsCredit</c>).</summary>
+        public bool? SeizedByOtherFinancier { get; set; }
         public string? BodyType { get; set; }
         /// <summary>Gearbox type recorded by the AVO. Printed on the cover, which
         /// hard-coded "MANUAL" for every vehicle before this existed.</summary>

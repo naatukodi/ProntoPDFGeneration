@@ -61,6 +61,10 @@
         public string? Rto { get; set; }
         public string? Lender { get; set; }
         public decimal? ExShowroomPrice { get; set; }
+
+        /// <summary>Estimated further life, in years, from the backend page. Printed on page 3
+        /// for TVS Credit only. Must exist in BOTH copies of this DTO (see <see cref="RcStatusText"/>).</summary>
+        public int? EstimatedLifeRemaining { get; set; }
         public string? CategoryCode { get; set; }
         public string? NormsType { get; set; }
         public string? MakerVariant { get; set; }

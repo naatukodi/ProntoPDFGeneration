@@ -33,9 +33,13 @@ namespace Valuation.Api.Services
 
         /// <summary>Everything that differs between the two companies. Layout, spacing
         /// and wording are shared — only identity changes.</summary>
+        /// <remarks>LegalName signs every page's footer note; LegalNameShort closes the
+        /// disclaimer, in the wording the company wrote it (2026-09-30). Pronto's is the
+        /// legal name the portal's brand.service.ts gives it.</remarks>
         private sealed record BrandTheme(
             string Key, string Name, string Primary, string TintBg,
-            string LogoTrimmed, string LogoFull, string Watermark, string FooterNote);
+            string LogoTrimmed, string LogoFull, string Watermark,
+            string LegalName, string LegalNameShort);
 
         // Who signs the report off. Fixed, not resolved from the case: the approver is
         // the person who certifies the valuation, not whoever inspected the vehicle or
@@ -51,14 +55,14 @@ namespace Valuation.Api.Services
         private static readonly BrandTheme VehgaTheme = new(
             "vehga", "VEHGA", "#009688", "#E6F5F3",
             "vehga-logo-trimmed.png", "vehga-logo.png", "VEHGA VERIFIED",
-            "NOTE: THIS IS A DIGITALLY GENERATED REPORT, HENCE NO PHYSICAL SIGNATURE IS REQUIRED. VERIFIED VIA VEHGA SECURE CLOUD.");
+            "Vehga Inspections Private Limited", "Vehga Inspections Pvt Ltd");
 
         // Pronto's green is darkened from the logo's #02944E, which only reaches 3.9:1
         // on white; #02763E clears WCAG AA and matches Vehga's contrast on the page.
         private static readonly BrandTheme ProntoTheme = new(
             "pronto", "PRONTO MOTO", "#02763E", "#E8F5EE",
             "pronto-logo-trimmed.png", "pronto-logo-trimmed.png", "PRONTO VERIFIED",
-            "NOTE: THIS IS A DIGITALLY GENERATED REPORT, HENCE NO PHYSICAL SIGNATURE IS REQUIRED. VERIFIED VIA PRONTO SECURE CLOUD.");
+            "Pronto Moto Services", "Pronto Moto Services");
 
         // AsyncLocal rather than an instance field: the service may be registered as a
         // singleton, and two reports for different brands can be generated concurrently.
@@ -782,12 +786,14 @@ namespace Valuation.Api.Services
                     // Carlito; in Lato this line is wide enough that the full 0.15mm
                     // wraps "VEHGA SECURE CLOUD" onto a second line, which then sits
                     // under the rule and reads as a stray sentence.
+                    //
+                    // Wording from the company's 2026-09-30 notes. It replaced "... VERIFIED
+                    // VIA VEHGA SECURE CLOUD", so the company name took that phrase's bold.
                     t.DefaultTextStyle(x => x.FontFamily(ReportFont).FontSize(6f)
                         .FontColor(LabelFaint).LetterSpacing(Ls(0.04, 6)));
-                    t.Span("NOTE: THIS IS A DIGITALLY GENERATED REPORT, HENCE NO PHYSICAL SIGNATURE IS REQUIRED. VERIFIED VIA ");
-                    t.Span(Theme.Name == "VEHGA" ? "VEHGA SECURE CLOUD" : "PRONTO SECURE CLOUD")
-                        .Bold().FontColor(Theme.Primary);
-                    t.Span(".");
+                    t.Span("NOTE: THIS IS A DIGITALLY GENERATED REPORT BY ");
+                    t.Span(Theme.LegalName.ToUpperInvariant()).Bold().FontColor(Theme.Primary);
+                    t.Span(". HENCE NO PHYSICAL SIGNATURE IS REQUIRED.");
                 });
 
                 row.AutoItem().Text(t =>
