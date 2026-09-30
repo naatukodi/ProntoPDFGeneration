@@ -423,11 +423,11 @@ namespace Valuation.Api.Services
             DrawSectionHeading(main.Item().PaddingTop(Mm(3.6)).PaddingBottom(Mm(3)),
                                "indian-rupee", "Valuation & Checks");
 
-            // Laid out to the 2026-09-21 mockup: the value card; the chassis punch
-            // verdict over the dedupe and accident verdicts; blacklist and the two media
-            // links as a column of pills. Widths 3 : 3 : 2, the mockup's own proportions.
-            // Dedupe and accident status share one card's width (2026-09-30 notes), so
-            // they are the compact card, not the 13pt one chassis punch keeps.
+            // Laid out to the 2026-09-21 mockup: the value card; the verdicts; blacklist
+            // and the two media links as a column of pills. Widths 3 : 3 : 2, the
+            // mockup's own proportions. The verdicts are chassis punch, dedupe and
+            // accident status stacked, one line each (2026-09-30 mockup), at the pills'
+            // height so the two columns line up.
             const double RowMm = 34, GapMm = 2;
             var punch    = ChassisPunchCheck(doc);
             var dedupe   = DedupeCheck(doc);
@@ -479,24 +479,20 @@ namespace Valuation.Api.Services
 
                 r.ConstantItem(Mm(4));
 
-                // chassis punch over dedupe | accident status
-                double cardMm = (RowMm - GapMm) / 2;
+                // chassis punch, dedupe, accident status
+                double pillMm = (RowMm - 2 * GapMm) / 3;
                 r.RelativeItem(3).Column(c =>
                 {
-                    c.Item().Height(Mm(cardMm)).Element(x => CheckCard(x, "CHASSIS PUNCH", punch));
+                    c.Item().Height(Mm(pillMm)).Element(x => CheckLine(x, "CHASSIS PUNCH", punch));
                     c.Item().Height(Mm(GapMm));
-                    c.Item().Height(Mm(cardMm)).Row(pair =>
-                    {
-                        pair.RelativeItem().Element(x => MiniCheckCard(x, "DEDUPE", dedupe));
-                        pair.ConstantItem(Mm(GapMm));
-                        pair.RelativeItem().Element(x => MiniCheckCard(x, "ACCIDENT STATUS", accident));
-                    });
+                    c.Item().Height(Mm(pillMm)).Element(x => CheckLine(x, "DEDUPE", dedupe));
+                    c.Item().Height(Mm(GapMm));
+                    c.Item().Height(Mm(pillMm)).Element(x => CheckLine(x, "ACCIDENT STATUS", accident));
                 });
 
                 r.ConstantItem(Mm(4));
 
                 // blacklist, then the two links
-                double pillMm = (RowMm - 2 * GapMm) / 3;
                 r.RelativeItem(2).Column(c =>
                 {
                     c.Item().Height(Mm(pillMm)).Element(x => StatusPill(x, black.Icon, black.Text, black.Tone));
@@ -776,67 +772,26 @@ namespace Valuation.Api.Services
         private const string ValueLabelInk = "#E6F6F6";
 
         /// <summary>
-        /// A verdict card: a ringed icon, a small caption, and the verdict in the tone's
-        /// colour. The caption sits on one line — in the mockup "CHASSIS PUNCH" broke
-        /// onto two and ran into the verdict beneath it.
+        /// A verdict on one line, "CHASSIS PUNCH - ORIGINAL", in the tone's colours
+        /// (2026-09-30 mockup). 8pt keeps the longest fixed pair, "ACCIDENT STATUS -
+        /// NOT RECORDED", on one line. ScaleToFit is for a chassis punch QC typed as
+        /// free text, which prints as typed: text that outgrew this fixed-height card
+        /// would fail the whole report rather than clip.
         /// </summary>
-        private void CheckCard(IContainer container, string caption,
+        private void CheckLine(IContainer container, string caption,
                                (string Value, string Tone, string Icon) check)
         {
-            var (bg, border, ring, glyph, ink) = CheckColors(check.Tone);
+            var (bg, border, _, _, ink) = CheckColors(check.Tone);
             container.Layers(l =>
             {
                 l.Layer().Svg(s => RoundRect(s.Width, s.Height, Mm(2.6), bg, border));
-                l.PrimaryLayer().PaddingLeft(Mm(3.7)).PaddingRight(Mm(3)).Row(r =>
+                l.PrimaryLayer().PaddingHorizontal(Mm(3.3)).AlignMiddle().ScaleToFit().Text(t =>
                 {
-                    r.AutoItem().AlignMiddle().Width(Mm(8.4)).Height(Mm(8.4)).Layers(b =>
-                    {
-                        b.Layer().Svg(s => CircleSvg(s.Width, s.Height, "#FFFFFF", ring, 1.2f));
-                        b.PrimaryLayer().AlignCenter().AlignMiddle()
-                         .Element(x => DrawIcon(x, check.Icon, glyph, 4.2));
-                    });
-                    r.ConstantItem(Mm(2.9));
-                    r.RelativeItem().AlignMiddle().Column(c =>
-                    {
-                        c.Item().Text(caption)
-                            .FontFamily(ReportFont).FontSize(7).Bold().FontColor(CheckLabelInk)
-                            .LetterSpacing(Ls(0.3, 7));
-                        c.Item().PaddingTop(Mm(0.4)).Text(check.Value)
-                            .FontFamily(ReportFont).FontSize(13).Bold().FontColor(ink)
-                            .LetterSpacing(Ls(0.3, 13)).LineHeight(1f);
-                    });
-                });
-            });
-        }
-
-        /// <summary>
-        /// A half-width verdict card: the caption with a small glyph, and the verdict
-        /// beneath. At half width there is no room for <see cref="CheckCard"/>'s
-        /// roundel, and "VERIFIED CLEAN" at its 13pt would need the whole card, so a
-        /// long verdict drops to 9pt and may take two lines; a short one ("NO",
-        /// "PENDING") keeps the big size.
-        /// </summary>
-        private void MiniCheckCard(IContainer container, string caption,
-                                   (string Value, string Tone, string Icon) check)
-        {
-            var (bg, border, _, glyph, ink) = CheckColors(check.Tone);
-            float size = check.Value.Length <= 8 ? 13f : 9f;
-            container.Layers(l =>
-            {
-                l.Layer().Svg(s => RoundRect(s.Width, s.Height, Mm(2.6), bg, border));
-                l.PrimaryLayer().PaddingHorizontal(Mm(2.8)).AlignMiddle().Column(c =>
-                {
-                    c.Item().Row(r =>
-                    {
-                        r.AutoItem().AlignMiddle().Element(x => DrawIcon(x, check.Icon, glyph, 3.2, 2.4));
-                        r.ConstantItem(Mm(1.2));
-                        r.RelativeItem().AlignMiddle().Text(caption)
-                            .FontFamily(ReportFont).FontSize(6.2f).Bold().FontColor(CheckLabelInk)
-                            .LetterSpacing(Ls(0.2, 6.2));
-                    });
-                    c.Item().PaddingTop(Mm(0.8)).Text(check.Value)
-                        .FontFamily(ReportFont).FontSize(size).Bold().FontColor(ink)
-                        .LetterSpacing(Ls(0.2, size)).LineHeight(1f);
+                    t.DefaultTextStyle(x => x.FontFamily(ReportFont).FontSize(8).Bold()
+                        .LetterSpacing(Ls(0.2, 8)));
+                    t.Span(caption).FontColor(Navy);
+                    t.Span(" - ").FontColor(LabelFaint);
+                    t.Span(check.Value).FontColor(ink);
                 });
             });
         }
