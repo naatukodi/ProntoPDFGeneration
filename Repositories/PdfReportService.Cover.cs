@@ -423,14 +423,16 @@ namespace Valuation.Api.Services
             DrawSectionHeading(main.Item().PaddingTop(Mm(3.6)).PaddingBottom(Mm(3)),
                                "indian-rupee", "Valuation & Checks");
 
-            // Laid out to the 2026-09-21 mockup: the value card; the chassis punch and
-            // dedupe verdicts as two stacked cards; blacklist and the two media links as
-            // a column of pills. Widths 3 : 3 : 2, the mockup's own proportions — the
-            // verdict cards need the room for "VERIFIED CLEAN" at 13pt, the pills do not.
+            // Laid out to the 2026-09-21 mockup: the value card; the chassis punch
+            // verdict over the dedupe and accident verdicts; blacklist and the two media
+            // links as a column of pills. Widths 3 : 3 : 2, the mockup's own proportions.
+            // Dedupe and accident status share one card's width (2026-09-30 notes), so
+            // they are the compact card, not the 13pt one chassis punch keeps.
             const double RowMm = 34, GapMm = 2;
-            var punch  = ChassisPunchCheck(doc);
-            var dedupe = DedupeCheck(doc);
-            var black  = BlacklistCheck(doc);
+            var punch    = ChassisPunchCheck(doc);
+            var dedupe   = DedupeCheck(doc);
+            var accident = AccidentCheck(doc);
+            var black    = BlacklistCheck(doc);
 
             string? galleryUrl = (_blobContainer != null && !string.IsNullOrWhiteSpace(_blobBaseUrl))
                 ? $"{_blobBaseUrl.TrimEnd('/')}/{_blobContainer.Name}/{referenceNumber}-gallery.html"
@@ -477,13 +479,18 @@ namespace Valuation.Api.Services
 
                 r.ConstantItem(Mm(4));
 
-                // chassis punch over dedupe
+                // chassis punch over dedupe | accident status
                 double cardMm = (RowMm - GapMm) / 2;
                 r.RelativeItem(3).Column(c =>
                 {
                     c.Item().Height(Mm(cardMm)).Element(x => CheckCard(x, "CHASSIS PUNCH", punch));
                     c.Item().Height(Mm(GapMm));
-                    c.Item().Height(Mm(cardMm)).Element(x => CheckCard(x, "DEDUPE", dedupe));
+                    c.Item().Height(Mm(cardMm)).Row(pair =>
+                    {
+                        pair.RelativeItem().Element(x => MiniCheckCard(x, "DEDUPE", dedupe));
+                        pair.ConstantItem(Mm(GapMm));
+                        pair.RelativeItem().Element(x => MiniCheckCard(x, "ACCIDENT STATUS", accident));
+                    });
                 });
 
                 r.ConstantItem(Mm(4));
@@ -801,6 +808,51 @@ namespace Valuation.Api.Services
                 });
             });
         }
+
+        /// <summary>
+        /// A half-width verdict card: the caption with a small glyph, and the verdict
+        /// beneath. At half width there is no room for <see cref="CheckCard"/>'s
+        /// roundel, and "VERIFIED CLEAN" at its 13pt would need the whole card, so a
+        /// long verdict drops to 9pt and may take two lines; a short one ("NO",
+        /// "PENDING") keeps the big size.
+        /// </summary>
+        private void MiniCheckCard(IContainer container, string caption,
+                                   (string Value, string Tone, string Icon) check)
+        {
+            var (bg, border, _, glyph, ink) = CheckColors(check.Tone);
+            float size = check.Value.Length <= 8 ? 13f : 9f;
+            container.Layers(l =>
+            {
+                l.Layer().Svg(s => RoundRect(s.Width, s.Height, Mm(2.6), bg, border));
+                l.PrimaryLayer().PaddingHorizontal(Mm(2.8)).AlignMiddle().Column(c =>
+                {
+                    c.Item().Row(r =>
+                    {
+                        r.AutoItem().AlignMiddle().Element(x => DrawIcon(x, check.Icon, glyph, 3.2, 2.4));
+                        r.ConstantItem(Mm(1.2));
+                        r.RelativeItem().AlignMiddle().Text(caption)
+                            .FontFamily(ReportFont).FontSize(6.2f).Bold().FontColor(CheckLabelInk)
+                            .LetterSpacing(Ls(0.2, 6.2));
+                    });
+                    c.Item().PaddingTop(Mm(0.8)).Text(check.Value)
+                        .FontFamily(ReportFont).FontSize(size).Bold().FontColor(ink)
+                        .LetterSpacing(Ls(0.2, size)).LineHeight(1f);
+                });
+            });
+        }
+
+        /// <summary>
+        /// Accident status as the AVO recorded it. NOT RECORDED rather than a guess
+        /// for cases inspected before the question existed — QC typed it into REMARKS
+        /// then, and those remarks still say it.
+        /// </summary>
+        private static (string Value, string Tone, string Icon) AccidentCheck(ValuationDocument doc) =>
+            doc.InspectionDetails?.Accidental switch
+            {
+                false => ("NO", "good", "circle-check"),
+                true  => ("YES", "poor", "triangle-alert"),
+                null  => ("NOT RECORDED", "neutral", "circle-alert"),
+            };
 
         /// <summary>A one-line status pill: icon, then text, in the tone's colours.</summary>
         private void StatusPill(IContainer container, string icon, string text, string tone)
