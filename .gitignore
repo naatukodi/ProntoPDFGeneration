@@ -13,3 +13,6 @@ appsettings.Local.json
 .vs/
 .vscode/
 *.zip
+
+# macOS folder metadata
+.DS_Store
