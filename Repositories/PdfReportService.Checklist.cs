@@ -272,8 +272,9 @@ namespace Valuation.Api.Services
         }
 
         /// <summary>
-        /// The box, styled as the unscored cards above it. As the notes draw it: VIN
-        /// plate beside estimated life, the seized question on a line of its own.
+        /// The box, styled as the unscored cards above it, to the company's 2026-10-01
+        /// sketch: two lines, VIN plate then the seized question, with their answers lined
+        /// up in one column; estimated life remaining at the right of the VIN plate line.
         /// </summary>
         private void AdditionalDetailsSection(IContainer container, List<AdditionalItem> items, double rowExtra)
         {
@@ -285,34 +286,42 @@ namespace Valuation.Api.Services
                     SectionHeader(c, "ADDITIONAL DETAILS", "info", null);
                     c.Item().PaddingTop(Mm(1.2)).PaddingBottom(Mm(1.6)).PaddingHorizontal(Mm(2.6)).Column(rows =>
                     {
-                        rows.Item().Row(r =>
-                        {
-                            r.RelativeItem().Element(x => AdditionalRow(x, items[0], false, rowExtra));
-                            r.ConstantItem(Mm(5));
-                            r.RelativeItem().Element(x => AdditionalRow(x, items[1], false, rowExtra));
-                        });
+                        rows.Item().Element(x => AdditionalRow(x, items[0], false, rowExtra, trailing: items[1]));
                         rows.Item().Element(x => AdditionalRow(x, items[2], true, rowExtra));
                     });
                 });
             });
         }
 
+        /// <summary>Width of the question column: the seized question at 8.2pt, on one line,
+        /// so both answers start at the same place.</summary>
+        private const double AdditionalLabelMm = 70;
+
         /// <summary>
-        /// A line of the box, spaced as <see cref="ChecklistRow"/> so it grows with the page.
-        /// The answer follows its question rather than sitting at the far edge as the
-        /// checklist's pills do (2026-10-01): here each line reads as a statement.
+        /// A line of the box, spaced as <see cref="ChecklistRow"/> so it grows with the page:
+        /// the question, its answer in the shared answer column, and optionally a second
+        /// question and answer at the right edge (<paramref name="trailing"/>).
         /// </summary>
-        private void AdditionalRow(IContainer container, AdditionalItem item, bool last, double rowExtra)
+        private void AdditionalRow(IContainer container, AdditionalItem item, bool last, double rowExtra,
+                                   AdditionalItem? trailing = null)
         {
             container.BorderBottom(last ? 0 : 1).BorderColor("#F3F6F9")
                      .PaddingVertical(Mm(Math.Max(0.1, 0.6 + rowExtra / 2))).PaddingHorizontal(Mm(3)).Row(r =>
             {
-                r.AutoItem().AlignMiddle().Text(item.Label)
+                r.ConstantItem(Mm(AdditionalLabelMm)).AlignMiddle().Text(item.Label)
                     .FontFamily(ReportFont).FontSize(8.2f).FontColor(InkSoft)
                     .LetterSpacing(Ls(0.1, 8.2));
                 r.ConstantItem(Mm(3));
                 r.AutoItem().MinWidth(Mm(12)).AlignMiddle().Element(x => CentredPill(x, item.Value, item.Tone));
                 r.RelativeItem();
+                if (trailing != null)
+                {
+                    r.AutoItem().AlignMiddle().Text(trailing.Label)
+                        .FontFamily(ReportFont).FontSize(8.2f).FontColor(InkSoft)
+                        .LetterSpacing(Ls(0.1, 8.2));
+                    r.ConstantItem(Mm(3));
+                    r.AutoItem().MinWidth(Mm(12)).AlignMiddle().Element(x => CentredPill(x, trailing.Value, trailing.Tone));
+                }
             });
         }
 
