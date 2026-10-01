@@ -521,7 +521,7 @@ namespace Valuation.Api.Services
                             .FontFamily(ReportFont).FontSize(6.6f).Bold().FontColor(Orange)
                             .LetterSpacing(Ls(0.25, 6.6));
                         c.Item().PaddingTop(Mm(1.2)).Dynamic(new RemarkText(
-                            doc.QualityControl?.Remarks ?? "Vehicle found in good road worthy condition."));
+                            CoverRemarks(doc)));
                     });
                 });
 
@@ -766,6 +766,24 @@ namespace Valuation.Api.Services
                     });
                 });
             });
+        }
+
+        /// <summary>
+        /// The cover's REMARKS: QC's remarks, or the standard remark when QC left them
+        /// empty — blank as well as missing, now that clearing the box saves an empty
+        /// string. On a TVS Credit case with no VIN plate, the company's sentence for that
+        /// follows on a line of its own (2026-10-01), unless QC already wrote it.
+        /// </summary>
+        private static string CoverRemarks(ValuationDocument doc)
+        {
+            var remarks = doc.QualityControl?.Remarks?.Trim();
+            if (string.IsNullOrEmpty(remarks)) remarks = "Vehicle found in good road worthy condition.";
+
+            if (IsTvsCredit(doc) && doc.InspectionDetails?.VinPlate == false
+                && !remarks.Contains(VinPlateMissingText, StringComparison.OrdinalIgnoreCase))
+                remarks += "\n" + VinPlateMissingText;
+
+            return remarks;
         }
 
         /// <summary>The "ESTIMATED MARKET VALUE" caption on the value card, sampled from the mockup.</summary>
