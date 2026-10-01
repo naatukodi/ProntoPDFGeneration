@@ -879,7 +879,9 @@ namespace Valuation.Api.Services
         /// <summary>
         /// How an answer scores — the portal's answerPoints in inspection-score.ts.
         /// Condition: as MapVerdict reads it (GOOD 8.5 … NO 1.0).
-        /// NoIsGood: the question asks about a fault (Fluid Leaks), so NO scores 8.5 and YES 1.0.
+        /// NoIsGood: the question asks about a fault (Fluid Leaks, Warning Lights On), so NO
+        /// scores 8.5 and YES 1.0. Warning Lights On joined on 2026-10-01: it used to read as
+        /// "do the lights work", with YES good.
         /// ZeroIsGood: a count of faults (Missing Tyres): 0 scores 8.5, 1 or more 1.0.
         /// </summary>
         private enum AnswerScoring { Condition, NoIsGood, ZeroIsGood }
@@ -962,7 +964,7 @@ namespace Valuation.Api.Services
                     new("ENGINE STARTED", "engineStarted"),
                     new("TEST DRIVE", "testDrive"),
                     new("VEHICLE MOVED", "vehicleMoved"),
-                    new("WARNING LIGHTS", "warningLights"),
+                    new("WARNING LIGHTS ON", "warningLights", Scoring: AnswerScoring.NoIsGood),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
                     new("AUDIO", "audio"),
@@ -1033,7 +1035,7 @@ namespace Valuation.Api.Services
                     new("ENGINE STARTED", "engineStarted"),
                     new("TEST DRIVE", "testDrive"),
                     new("VEHICLE MOVED", "vehicleMoved"),
-                    new("WARNING LIGHTS", "warningLights"),
+                    new("WARNING LIGHTS ON", "warningLights", Scoring: AnswerScoring.NoIsGood),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
                     new("AUDIO", "audio"),
@@ -1103,7 +1105,7 @@ namespace Valuation.Api.Services
                     new("ENGINE STARTED", "engineStarted"),
                     new("TEST RIDE", "testDrive"),
                     new("VEHICLE MOVED", "vehicleMoved"),
-                    new("WARNING LIGHTS", "warningLights"),
+                    new("WARNING LIGHTS ON", "warningLights", Scoring: AnswerScoring.NoIsGood),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
                     new("MAIN STAND", "mainStand"),
@@ -1175,7 +1177,7 @@ namespace Valuation.Api.Services
                     new("ENGINE STARTED", "engineStarted"),
                     new("TEST DRIVE", "testDrive"),
                     new("VEHICLE MOVED", "vehicleMoved"),
-                    new("WARNING LIGHTS", "warningLights"),
+                    new("WARNING LIGHTS ON", "warningLights", Scoring: AnswerScoring.NoIsGood),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
                     new("AUDIO", "audio"),
@@ -1245,7 +1247,7 @@ namespace Valuation.Api.Services
                     new("ENGINE STARTED", "engineStarted"),
                     new("FUNCTIONAL TEST", "testDrive"),
                     new("MACHINE MOVED", "vehicleMoved"),
-                    new("WARNING LIGHTS", "warningLights"),
+                    new("WARNING LIGHTS ON", "warningLights", Scoring: AnswerScoring.NoIsGood),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
                     new("SWING MECHANISM", "swingMechanism"),
@@ -1317,7 +1319,7 @@ namespace Valuation.Api.Services
                     new("ENGINE STARTED", "engineStarted"),
                     new("TEST DRIVE", "testDrive"),
                     new("VEHICLE MOVED", "vehicleMoved"),
-                    new("WARNING LIGHTS", "warningLights"),
+                    new("WARNING LIGHTS ON", "warningLights", Scoring: AnswerScoring.NoIsGood),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
                     new("AIR CONDITIONER", "airConditioner"),
@@ -1389,7 +1391,7 @@ namespace Valuation.Api.Services
                     new("ENGINE STARTED", "engineStarted"),
                     new("FIELD FUNCTION TEST", "testDrive"),
                     new("VEHICLE MOVED", "vehicleMoved"),
-                    new("WARNING LIGHTS", "warningLights"),
+                    new("WARNING LIGHTS ON", "warningLights", Scoring: AnswerScoring.NoIsGood),
                 }),
                 new("OTHER SYSTEMS", new FieldDef[] {
                     new("MUFFLER", "muffler"),

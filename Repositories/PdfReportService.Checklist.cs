@@ -235,7 +235,7 @@ namespace Valuation.Api.Services
 
         /// <summary>What a missing VIN plate prints, in the company's own wording.</summary>
         private const string VinPlateMissingText =
-            "Not available on the vehicle, whereas chassis number verified physically and found genuine";
+            "VIN plate not found. Chassis number physically inspected and found original.";
 
         /// <summary>One line of the box. <paramref name="Sentence"/> prints the value as text
         /// rather than a pill — the missing-VIN wording is far too long for one.</summary>
@@ -247,7 +247,7 @@ namespace Valuation.Api.Services
         {
             var ins  = doc.InspectionDetails;
             var life = doc.VehicleDetails?.EstimatedLifeRemaining;
-            const string Seized = "IS IT A SEIZED VEHICLE OF ANY OTHER FINANCE COMPANY";
+            const string Seized = "SEIZED BY OTHER FINANCIER";
             return new()
             {
                 ins?.VinPlate switch
@@ -270,8 +270,7 @@ namespace Valuation.Api.Services
 
         /// <summary>
         /// The box, styled as the unscored cards above it. As the notes draw it: VIN
-        /// plate beside estimated life, the seized question across the full width —
-        /// at 8.2pt it is too long for half.
+        /// plate beside estimated life, the seized question on a line of its own.
         /// </summary>
         private void AdditionalDetailsSection(IContainer container, List<AdditionalItem> items, double rowExtra)
         {
