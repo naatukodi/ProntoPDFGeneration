@@ -233,13 +233,16 @@ namespace Valuation.Api.Services
             System.Text.RegularExpressions.Regex.IsMatch(doc.Stakeholder?.Name ?? "", @"\bTVS\s*CREDIT\b",
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
-        /// <summary>What a missing VIN plate prints, in the company's own wording.</summary>
+        /// <summary>
+        /// What a missing VIN plate adds to the cover's REMARKS on a TVS Credit report, in
+        /// the company's own wording. It goes there rather than into this box (2026-10-01);
+        /// the box just says NOT AVAILABLE.
+        /// </summary>
         private const string VinPlateMissingText =
             "VIN plate not found. Chassis number physically inspected and found original.";
 
-        /// <summary>One line of the box. <paramref name="Sentence"/> prints the value as text
-        /// rather than a pill — the missing-VIN wording is far too long for one.</summary>
-        private sealed record AdditionalItem(string Label, string Value, string Tone, bool Sentence = false);
+        /// <summary>One line of the box: the question, then its answer pill.</summary>
+        private sealed record AdditionalItem(string Label, string Value, string Tone);
 
         /// <summary>The three lines, in the order the notes lay them out. NA for anything the
         /// case predates: those were asked in REMARKS, and still say so there.</summary>
@@ -247,13 +250,13 @@ namespace Valuation.Api.Services
         {
             var ins  = doc.InspectionDetails;
             var life = doc.VehicleDetails?.EstimatedLifeRemaining;
-            const string Seized = "SEIZED BY OTHER FINANCIER";
+            const string Seized = "IS THE VEHICLE SEIZED BY OTHER FINANCIER";
             return new()
             {
                 ins?.VinPlate switch
                 {
                     true  => new("VIN PLATE", "AVAILABLE", "good"),
-                    false => new("VIN PLATE", VinPlateMissingText, "neutral", Sentence: true),
+                    false => new("VIN PLATE", "NOT AVAILABLE", "poor"),
                     null  => new("VIN PLATE", "NA", "na"),
                 },
                 life is int years
@@ -294,27 +297,22 @@ namespace Valuation.Api.Services
             });
         }
 
-        /// <summary>A line of the box, spaced as <see cref="ChecklistRow"/> so it grows with the page.</summary>
+        /// <summary>
+        /// A line of the box, spaced as <see cref="ChecklistRow"/> so it grows with the page.
+        /// The answer follows its question rather than sitting at the far edge as the
+        /// checklist's pills do (2026-10-01): here each line reads as a statement.
+        /// </summary>
         private void AdditionalRow(IContainer container, AdditionalItem item, bool last, double rowExtra)
         {
             container.BorderBottom(last ? 0 : 1).BorderColor("#F3F6F9")
                      .PaddingVertical(Mm(Math.Max(0.1, 0.6 + rowExtra / 2))).PaddingHorizontal(Mm(3)).Row(r =>
             {
-                if (item.Sentence)
-                {
-                    r.AutoItem().AlignMiddle().Text(item.Label)
-                        .FontFamily(ReportFont).FontSize(8.2f).FontColor(InkSoft)
-                        .LetterSpacing(Ls(0.1, 8.2));
-                    r.ConstantItem(Mm(3));
-                    r.RelativeItem().AlignMiddle().Text(item.Value)
-                        .FontFamily(ReportFont).FontSize(7.2f).Bold().FontColor(Navy).LineHeight(1.1f);
-                    return;
-                }
-                r.RelativeItem().AlignMiddle().Text(item.Label)
+                r.AutoItem().AlignMiddle().Text(item.Label)
                     .FontFamily(ReportFont).FontSize(8.2f).FontColor(InkSoft)
                     .LetterSpacing(Ls(0.1, 8.2));
-                r.ConstantItem(Mm(2));
+                r.ConstantItem(Mm(3));
                 r.AutoItem().MinWidth(Mm(12)).AlignMiddle().Element(x => CentredPill(x, item.Value, item.Tone));
+                r.RelativeItem();
             });
         }
 
