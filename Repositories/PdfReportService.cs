@@ -31,6 +31,10 @@ namespace Valuation.Api.Services
         private readonly BlobContainerClient? _blobContainer;
         private readonly string? _blobBaseUrl;
 
+        // Clients that send only a few photos and sometimes no video, from the App
+        // Service setting ClientRules__MediaOptionalClients. See IsMediaOptionalClient.
+        private readonly HashSet<string> _mediaOptionalClients;
+
         /// <summary>Everything that differs between the two companies. Layout, spacing
         /// and wording are shared — only identity changes.</summary>
         /// <remarks>LegalName signs every page's footer note; LegalNameShort closes the
@@ -99,6 +103,13 @@ namespace Valuation.Api.Services
             _blobBaseUrl      = configuration["BlobStorage:BaseUrl"];
             if (!string.IsNullOrWhiteSpace(blobConnStr))
                 _blobContainer = new BlobContainerClient(blobConnStr, blobContainer);
+
+            _mediaOptionalClients = new HashSet<string>(
+                (configuration["ClientRules:MediaOptionalClients"] ?? "")
+                    .Split(';')
+                    .Select(NormalizeClientName)
+                    .Where(n => n.Length > 0),
+                StringComparer.OrdinalIgnoreCase);
         }
 
         public async Task<ValuationDocument?> GetValuationDocumentAsync(

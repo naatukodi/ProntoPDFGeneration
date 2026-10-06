@@ -234,6 +234,22 @@ namespace Valuation.Api.Services
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
         /// <summary>
+        /// Whether the client is one that sends only a few photos and sometimes no video
+        /// (2026-10-06): the backend lets its cases past AVO without them, and the cover
+        /// leaves the video button off when there is none. The list is the App Service
+        /// setting ClientRules__MediaOptionalClients, e.g. "IndusInd Bank;Sakthi Finance
+        /// Limited", so adding a client needs no release — but it must read the same on
+        /// vehgapdf as on the backend. Names match whole, ignoring case and extra spaces,
+        /// exactly as the backend's ClientRules does: not a substring, or "Bank of India"
+        /// would catch "State Bank of India (SBI)".
+        /// </summary>
+        private bool IsMediaOptionalClient(ValuationDocument doc) =>
+            _mediaOptionalClients.Contains(NormalizeClientName(doc.Stakeholder?.Name));
+
+        private static string NormalizeClientName(string? name) =>
+            string.Join(' ', (name ?? "").Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        /// <summary>
         /// What a missing VIN plate adds to the cover's REMARKS on a TVS Credit report, in
         /// the company's own wording. It goes there rather than into this box (2026-10-01);
         /// the box just says NOT AVAILABLE.

@@ -439,6 +439,11 @@ namespace Valuation.Api.Services
                 : null;
             string? videoUrl = null;
             doc.VideoUrls?.TryGetValue("VehicleVideo", out videoUrl);
+            // A client that often sends no video (IsMediaOptionalClient) gets no video
+            // button rather than a grey N/A one when there isn't one (2026-10-06).
+            // Every other client keeps the N/A. The slot is left empty, not closed up,
+            // so the pills above still line up with the verdicts beside them.
+            bool showVideo = !string.IsNullOrWhiteSpace(videoUrl) || !IsMediaOptionalClient(doc);
 
             main.Item().Row(r =>
             {
@@ -498,8 +503,11 @@ namespace Valuation.Api.Services
                     c.Item().Height(Mm(pillMm)).Element(x => StatusPill(x, black.Icon, black.Text, black.Tone));
                     c.Item().Height(Mm(GapMm));
                     c.Item().Height(Mm(pillMm)).Element(x => LinkPill(x, "camera", "IMAGE LINK", galleryUrl));
-                    c.Item().Height(Mm(GapMm));
-                    c.Item().Height(Mm(pillMm)).Element(x => LinkPill(x, "video", "VIDEO LINK", videoUrl));
+                    if (showVideo)
+                    {
+                        c.Item().Height(Mm(GapMm));
+                        c.Item().Height(Mm(pillMm)).Element(x => LinkPill(x, "video", "VIDEO LINK", videoUrl));
+                    }
                 });
             });
 
