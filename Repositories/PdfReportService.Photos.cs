@@ -87,29 +87,31 @@ namespace Valuation.Api.Services
                 .Where(s => s.Image != null)
                 .ToList();
 
-            // Read once, outside the fills: the fills compose their page again at every
-            // step of a search, and each shape is a read of the photo's header.
-            var tyreRow = tyres.Select(t => (Image: t, Aspect: PhotoAspect(t))).ToList();
-            double tyreH = TyreRowHeightMm(tyreRow.Select(t => t.Aspect).ToList());
+            // Shapes and backdrops are worked out once, outside the fills: the fills compose
+            // their page again at every step of a search, and a backdrop is a full decode.
+            var tyreAspects = tyres.Select(PhotoAspect).ToList();
+            double tyreH = TyreRowHeightMm(tyreAspects);
+            double tyreSlot = TyreSlotMm / Math.Max(tyreH, 1);
+            var tyreRow = tyres.Select((t, i) => new GalleryPhoto($"TYRE {i + 1}", t,
+                    PanelFit.For(t, tyreAspects[i], tyreSlot)))
+                .ToList();
 
             // The identification shots close the gallery, and they are photographs like
             // any other, so they continue the grid instead of starting a row of their own.
             // On AP39X8199 the last page held five photos and the chassis number went to a
             // page of its own, leaving the half beside the selfie empty.
-            var rows = GalleryRows(walkAround.Concat(chassisId)
-                .Select(p => new GalleryPhoto(p.Label, p.Image!, PhotoAspect(p.Image!)))
-                .ToList());
+            var gallery = walkAround.Concat(chassisId)
+                .Select(p => new GalleryPhoto(p.Label, p.Image!,
+                    PanelFit.For(p.Image!, PhotoAspect(p.Image!), GalleryAspect)))
+                .ToList();
 
             // What follows the photographs, in the order it reads.
             var closing = new List<ClosingPart>();
             if (tyres.Count > 0) closing.Add(ClosingPart.Tyres);
             closing.Add(ClosingPart.Disclaimer);
 
-            // Six photos to every page but the last: three rows of two, which MaxRowMm
-            // keeps within a page whatever the photos' shapes.
-            var pages = rows.Chunk(PhotosPerPage / 2).Select(p => p.ToList()).ToList();
-            int galleryPages = pages.Count;
-            var lastSlice = galleryPages > 0 ? pages[^1] : new List<GalleryRow>();
+            int galleryPages = (gallery.Count + PhotosPerPage - 1) / PhotosPerPage;
+            var lastSlice = gallery.Skip(Math.Max(0, galleryPages - 1) * PhotosPerPage).ToList();
 
             // How many closing parts ride up onto the last gallery page, from the front:
             // a last page holding one row of photos used to leave ~156mm of white above
@@ -122,13 +124,13 @@ namespace Valuation.Api.Services
             bool ClosingHeading() => Rest().Any(p => p != ClosingPart.Disclaimer) || galleryPages == 0;
             int PhotoPages() => galleryPages + (Rest().Count > 0 && ClosingHeading() ? 1 : 0);
 
-            void GalleryPage(IContainer container, List<GalleryRow> slice,
+            void GalleryPage(IContainer container, List<GalleryPhoto> slice,
                              int lift, bool measuring, string tag)
             {
                 container.Column(col =>
                 {
                     DrawSectionHeading(col.Item().PaddingBottom(Mm(3)), "camera", "Photographic Evidence", tag);
-                    PhotoGrid(col, slice, measuring);
+                    PhotoGrid(col, slice, GalleryPanelMm, measuring);
                     ClosingParts(col, closing.Take(lift).ToList(), afterPhotos: true,
                                  tyreRow, tyreH, measuring);
                 });
@@ -160,7 +162,7 @@ namespace Valuation.Api.Services
                 if (pageNo > 1) main.Item().PageBreak();
                 int thisPage = pageNo;
                 bool last = pageNo == galleryPages;
-                var slice = pages[pageNo - 1];
+                var slice = gallery.Skip((pageNo - 1) * PhotosPerPage).Take(PhotosPerPage).ToList();
 
                 // Nothing stretches (maxMm 0): the fill is kept for its replay of the
                 // layout decision, and so the lifted closing parts are composed lazily.
@@ -183,68 +185,49 @@ namespace Valuation.Api.Services
             });
         }
 
-        /// <summary>A gallery photograph and the shape it prints at, width over height.</summary>
-        private sealed record GalleryPhoto(string Label, byte[] Image, double Aspect);
-
-        /// <summary>A row of the gallery: its photos, and the height they share.</summary>
-        private sealed record GalleryRow(List<GalleryPhoto> Photos, double HeightMm);
-
-        /// <summary>Gap between the two photos of a row, and between rows.</summary>
-        private const double PhotoGapMm = 4, RowGapMm = 3.6;
+        /// <summary>A photograph for a panel: its caption, and how it fits the panel.</summary>
+        private sealed record GalleryPhoto(string Label, byte[] Image, PanelFit Fit);
 
         /// <summary>
-        /// The tallest a gallery row may be, so three rows always share a page: 3 x 74mm,
-        /// plus three 6.8mm captions and two gaps, is 249.6mm of the ~253mm under the
-        /// heading. A pair of 4:3 shots comes to 68mm and never reaches it; a pair of
-        /// portrait shots would be 121mm uncapped and prints at 55 x 74mm each.
+        /// How a photo sits in a panel: filling it, when the two are the same shape to
+        /// within 1% (a stretch that small does not show, where the margin it would
+        /// otherwise leave does), or whole and centred over a blurred copy of itself.
         /// </summary>
-        private const double MaxRowMm = 74;
-
-        /// <summary>
-        /// The gallery's rows, two photos to a row, each printed whole at its own shape.
-        ///
-        /// Photos used to be cut to a fixed 91 x 66mm frame, which suited only a 4:3 shot.
-        /// The camera apps in use upload 4:3, 16:9, 2:1 and portrait, and every other shape
-        /// lost its edges to the crop — on TG07V8118's 2:1 shots, a sixth off each side
-        /// and with it the GPS stamp at the bottom right; portrait shots lost almost half
-        /// their height. Now the two photos of a row share one height and split the width
-        /// in proportion to their shapes, so each fills its own frame exactly. The row is
-        /// narrower than the page only when it reaches <see cref="MaxRowMm"/>, and a photo
-        /// left alone on the last row keeps to a half column, as it always has.
-        /// </summary>
-        private static List<GalleryRow> GalleryRows(List<GalleryPhoto> photos)
+        private sealed record PanelFit(bool Fills, byte[]? Backdrop)
         {
-            // Rounding leaves the widths a hair over the column; a row that is even 0.01pt
-            // too wide for the page is a layout failure, so it is built a fraction under.
-            const double Usable = 2 * HalfColumnMm - 0.2;
-
-            var rows = new List<GalleryRow>();
-            for (int i = 0; i < photos.Count; i += 2)
-            {
-                var pair = photos.Skip(i).Take(2).ToList();
-                double h = pair.Count == 2
-                    ? Usable / pair.Sum(p => p.Aspect)
-                    : HalfColumnMm / pair[0].Aspect;
-                rows.Add(new GalleryRow(pair, Math.Min(h, MaxRowMm)));
-            }
-            return rows;
+            public static PanelFit For(byte[] image, double photoAspect, double panelAspect) =>
+                Math.Abs(photoAspect / panelAspect - 1) <= 0.01
+                    ? new PanelFit(true, null)
+                    : new PanelFit(false, BlurredBackdrop(image, panelAspect));
         }
 
-        /// <summary>Each row of photos, centred, each photo over its caption.</summary>
-        private void PhotoGrid(ColumnDescriptor col, List<GalleryRow> rows, bool measuring)
+        /// <summary>
+        /// Gallery panels are 91mm wide and exactly 4:3, the shape of the 1600 x 1200 shots
+        /// most cases arrive with, so those fill their panel edge to edge. Six of them fill
+        /// a page: three rows end ~21mm above the footer.
+        /// </summary>
+        private const double GalleryPanelMm = HalfColumnMm * 3 / 4;
+        private const double GalleryAspect = HalfColumnMm / GalleryPanelMm;
+
+        /// <summary>Photos two to a row, each over its caption.</summary>
+        private void PhotoGrid(ColumnDescriptor col, List<GalleryPhoto> photos,
+                               double panelMm, bool measuring)
         {
-            for (int r = 0; r < rows.Count; r++)
+            for (int r = 0; r < photos.Count; r += 2)
             {
-                if (r > 0) col.Item().Height(Mm(RowGapMm));
-                var row = rows[r];
-                col.Item().AlignCenter().Row(line =>
+                if (r > 0) col.Item().Height(Mm(3.6));
+                col.Item().Row(row =>
                 {
-                    for (int i = 0; i < row.Photos.Count; i++)
+                    for (int c = 0; c < 2; c++)
                     {
-                        if (i > 0) line.ConstantItem(Mm(PhotoGapMm));
-                        var photo = row.Photos[i];
-                        line.ConstantItem(Mm(photo.Aspect * row.HeightMm)).Element(x =>
-                            LabelledPhoto(x, photo.Image, photo.Label, row.HeightMm, measuring));
+                        if (c > 0) row.ConstantItem(Mm(4));
+                        int idx = r + c;
+                        if (idx < photos.Count)
+                        {
+                            var item = photos[idx];
+                            row.RelativeItem().Element(x => LabelledPhoto(x, item, panelMm, measuring));
+                        }
+                        else row.RelativeItem();   // keep the surviving photo at half width
                     }
                 });
             }
@@ -253,10 +236,7 @@ namespace Valuation.Api.Services
         /// <summary>
         /// The shape a photo prints at, width over height. Read from the file's header, not
         /// a full decode, and turned by its EXIF orientation as QuestPDF draws it, so a
-        /// phone shot stored on its side is framed upright.
-        ///
-        /// Held between 1:2 and 3:1: a sliver of an image would make its row-mate a sliver
-        /// too. A photo outside that is shown whole in its frame, with a margin of panel.
+        /// phone shot stored on its side is measured upright.
         /// </summary>
         private static double PhotoAspect(byte[] image)
         {
@@ -271,9 +251,33 @@ namespace Valuation.Api.Services
                 if (codec.EncodedOrigin is SKEncodedOrigin.LeftTop or SKEncodedOrigin.RightTop
                                         or SKEncodedOrigin.RightBottom or SKEncodedOrigin.LeftBottom)
                     aspect = 1 / aspect;
-                return Math.Clamp(aspect, 0.5, 3.0);
+                return aspect;
             }
             catch { return Fallback; }
+        }
+
+        /// <summary>
+        /// A photo shown whole, never cropped: filling its box when the shapes match,
+        /// otherwise centred over its backdrop.
+        ///
+        /// Panels used to be filled by cropping the photo to their shape, which suited only
+        /// a 4:3 shot. Cases arrive in 4:3, 16:9, 2:1 and portrait, and every other shape
+        /// lost its edges: on TG07V8118's 2:1 shots a sixth off each side, and with it the
+        /// GPS stamp at the bottom right; portrait shots lost almost half their height. The
+        /// cover's photo was stretched instead, and printed that truck a third too narrow.
+        /// </summary>
+        private static void WholePhoto(IContainer container, byte[] image, PanelFit fit)
+        {
+            if (fit.Fills)
+            {
+                container.Image(image).FitUnproportionally();
+                return;
+            }
+            container.Layers(l =>
+            {
+                l.Layer().Element(b => { if (fit.Backdrop != null) b.Image(fit.Backdrop).FitUnproportionally(); });
+                l.PrimaryLayer().AlignCenter().AlignMiddle().Image(image).FitArea();
+            });
         }
 
         /// <summary>
@@ -353,7 +357,7 @@ namespace Valuation.Api.Services
         /// first part is spaced off the grid above.
         /// </summary>
         private void ClosingParts(ColumnDescriptor col, List<ClosingPart> parts, bool afterPhotos,
-                                  List<(byte[] Image, double Aspect)> tyres, double tyreH, bool measuring)
+                                  List<GalleryPhoto> tyres, double tyreH, bool measuring)
         {
             bool first = !afterPhotos;
             foreach (var part in parts)
@@ -370,15 +374,13 @@ namespace Valuation.Api.Services
                         {
                             for (int i = 0; i < 4; i++)
                             {
-                                if (i > 0) row.ConstantItem(Mm(TyreGapMm));
+                                if (i > 0) row.ConstantItem(Mm(3));
                                 if (i < tyres.Count)
                                 {
-                                    var img = tyres[i].Image;
-                                    int n = i + 1;
+                                    var tyre = tyres[i];
                                     // Shown whole: cropping a tyre to its panel would cut off
                                     // the tread, which is what the photograph evidences.
-                                    row.RelativeItem().Element(x =>
-                                        LabelledPhoto(x, img, $"TYRE {n}", tyreH, measuring));
+                                    row.RelativeItem().Element(x => LabelledPhoto(x, tyre, tyreH, measuring));
                                 }
                                 else row.RelativeItem();
                             }
@@ -418,32 +420,24 @@ namespace Valuation.Api.Services
             // Closed with the issuing company's name, which depends on the brand.
             "report is issued without prejudice by ";
 
-        /// <summary>The gap between tyre panels; four panels and three gaps span the page.</summary>
-        private const double TyreGapMm = 3;
+        /// <summary>The width of a tyre panel: four panels and three 3mm gaps span the page.</summary>
+        private const double TyreSlotMm = (2 * HalfColumnMm + 4 - 3 * 3) / 4;
 
         /// <summary>
         /// One panel height for the whole tyre row, from the shape of the photos in it.
         ///
         /// The tallest of the four relative to its width sets it, so that one fills its
-        /// panel exactly and the rest are letterboxed no more than they have to be; all four
-        /// share it so the row stays even. A set from one camera fills every panel. Capped
-        /// at 74mm, where the row would crowd the disclaimer off the page. There is no floor:
-        /// the 28mm one there was left 2:1 shots in a band of grey without making the tyre
-        /// itself any bigger.
+        /// panel exactly and the rest sit on their backdrops no more than they have to; all
+        /// four share it so the row stays even. A set from one camera fills every panel.
+        /// Capped at 74mm, where the row would crowd the disclaimer off the page. There is
+        /// no floor: the 28mm one there was left 2:1 shots in a band of grey without making
+        /// the tyre itself any bigger.
         /// </summary>
-        private static double TyreRowHeightMm(List<double> aspects)
-        {
-            if (aspects.Count == 0) return 0;
-            double slotMm = (2 * HalfColumnMm + PhotoGapMm - 3 * TyreGapMm) / 4;
-            return Math.Min(slotMm / aspects.Min(), 74);
-        }
+        private static double TyreRowHeightMm(List<double> aspects) =>
+            aspects.Count == 0 ? 0 : Math.Min(TyreSlotMm / aspects.Min(), 74);
 
-        /// <summary>
-        /// A photo panel with its caption pill beneath. The photo is shown whole, never
-        /// cropped or stretched: the gallery sizes each panel to its photo, so it fills it;
-        /// anywhere else it sits centred, with a margin of panel where the shapes differ.
-        /// </summary>
-        private void LabelledPhoto(IContainer container, byte[] image, string label,
+        /// <summary>A photo panel with its caption pill beneath, the photo shown whole.</summary>
+        private void LabelledPhoto(IContainer container, GalleryPhoto photo,
                                    double heightMm, bool measuring)
         {
             container.Column(c =>
@@ -457,14 +451,14 @@ namespace Valuation.Api.Services
                         // is fixed above — so the decode is skipped rather than repeated at
                         // every step of the search.
                         if (measuring) return;
-                        x.AlignCenter().AlignMiddle().Image(image).FitArea();
+                        WholePhoto(x, photo.Image, photo.Fit);
                     });
                     l.Layer().Svg(s => RoundedPhotoMask(s.Width, s.Height, Mm(2.8), BorderImg));
                 });
 
-                // Scaled down rather than overflowing when the caption is wider than its
-                // photo: a portrait shot beside a panorama can be under 30mm wide, and a
-                // caption that overflows inside a page's fill throws the whole report.
+                // Scaled down rather than overflowing when a caption is wider than its
+                // photo: a custom photo's name can be any length, and a caption that
+                // overflows inside a page's fill throws the whole report.
                 c.Item().PaddingTop(Mm(1.8)).AlignLeft().ScaleToFit().Layers(l =>
                 {
                     l.Layer().Svg(s => RoundRect(s.Width, s.Height, Mm(10), Navy));
@@ -472,7 +466,7 @@ namespace Valuation.Api.Services
                     {
                         r.AutoItem().AlignMiddle().Element(x => DrawIcon(x, "camera", "#FFFFFF", 3.2));
                         r.ConstantItem(Mm(1.8));
-                        r.AutoItem().AlignMiddle().Text(label)
+                        r.AutoItem().AlignMiddle().Text(photo.Label)
                             .FontFamily(ReportFont).FontSize(7.4f).Bold().FontColor("#FFFFFF")
                             .LetterSpacing(Ls(0.3, 7.4));
                     });

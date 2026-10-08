@@ -222,18 +222,10 @@ namespace Valuation.Api.Services
                                    ?? photos.Values.FirstOrDefault();
                         if (img != null)
                         {
-                            // Whole and at its own shape. Stretched into this 4:3 box, the
+                            // Whole, as on the photo pages: stretched into this 4:3 box, the
                             // 2:1 shots on TG07V8118 printed the truck a third too narrow.
-                            // Where the shapes differ, a blurred copy of the photo fills the
-                            // box behind it instead of bands of grey.
                             const double box = 100.0 / 75;
-                            var backdrop = Math.Abs(PhotoAspect(img) / box - 1) > 0.01
-                                ? BlurredBackdrop(img, box) : null;
-                            c.Layers(hero =>
-                            {
-                                hero.Layer().Element(b => { if (backdrop != null) b.Image(backdrop).FitUnproportionally(); });
-                                hero.PrimaryLayer().AlignCenter().AlignMiddle().Image(img).FitArea();
-                            });
+                            WholePhoto(c, img, PanelFit.For(img, PhotoAspect(img), box));
                         }
                         else c.Background("#F8FAFC").AlignCenter().AlignMiddle()
                               .Text("NO IMAGE AVAILABLE").FontFamily(ReportFont).FontSize(10).FontColor(Label);
