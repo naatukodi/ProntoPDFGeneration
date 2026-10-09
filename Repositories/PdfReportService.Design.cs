@@ -519,15 +519,27 @@ namespace Valuation.Api.Services
         }
 
         /// <summary>A label over its value, the report's standard field rendering.</summary>
+        /// <param name="maxLines">The most lines a value of several words may take; a
+        /// single word always takes one.</param>
         private void DrawField(IContainer container, string label, string? value,
-                               double labelPt = 6.6, double valuePt = 9.6)
+                               double labelPt = 6.6, double valuePt = 9.6, int maxLines = 1)
         {
+            var text = string.IsNullOrWhiteSpace(value) ? "-" : value.Trim();
+
+            // A value too long for its lines is drawn smaller rather than given another:
+            // each extra line on the cover pushes its sign-off row toward page two, and on
+            // AP39UM0018 two of them did. A single word — an engine or chassis number — is
+            // held to one line, because breaking it reads as a shorter number: that cover
+            // printed "B5.6B6A180D02132A6392185" with its last "9" alone below.
+            int lines = text.Contains(' ') ? maxLines : 1;
+
             container.Column(c =>
             {
                 c.Item().Text(label.ToUpperInvariant())
                     .FontFamily(ReportFont).FontSize((float)labelPt).Bold().FontColor(Label)
                     .LetterSpacing(Ls(0.25, labelPt));
-                c.Item().Text(string.IsNullOrWhiteSpace(value) ? "-" : value)
+                c.Item().MaxHeight((float)(valuePt * 1.15 * lines) + 0.5f).ScaleToFit()
+                    .Text(text)
                     .FontFamily(ReportFont).FontSize((float)valuePt).Bold().FontColor(Navy)
                     .LineHeight(1.15f);
             });
