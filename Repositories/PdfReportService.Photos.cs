@@ -87,15 +87,23 @@ namespace Valuation.Api.Services
                 .Where(s => s.Image != null)
                 .ToList();
 
-            // Worked out once, outside the fills: it decodes every tyre photo, and a fill
-            // would otherwise repeat that at each step of its search.
-            double tyreH = tyres.Count > 0 ? TyrePanelHeightMm(tyres, 43.5) : 0;
+            // Shapes and backdrops are worked out once, outside the fills: the fills compose
+            // their page again at every step of a search, and a backdrop is a full decode.
+            var tyreAspects = tyres.Select(PhotoAspect).ToList();
+            double tyreH = TyreRowHeightMm(tyreAspects);
+            double tyreSlot = TyreSlotMm / Math.Max(tyreH, 1);
+            var tyreRow = tyres.Select((t, i) => new GalleryPhoto($"TYRE {i + 1}", t,
+                    PanelFit.For(t, tyreAspects[i], tyreSlot)))
+                .ToList();
 
             // The identification shots close the gallery, and they are photographs like
             // any other, so they continue the grid instead of starting a row of their own.
             // On AP39X8199 the last page held five photos and the chassis number went to a
             // page of its own, leaving the half beside the selfie empty.
-            var gallery = walkAround.Concat(chassisId).ToList();
+            var gallery = walkAround.Concat(chassisId)
+                .Select(p => new GalleryPhoto(p.Label, p.Image!,
+                    PanelFit.For(p.Image!, PhotoAspect(p.Image!), GalleryAspect)))
+                .ToList();
 
             // What follows the photographs, in the order it reads.
             var closing = new List<ClosingPart>();
@@ -116,14 +124,7 @@ namespace Valuation.Api.Services
             bool ClosingHeading() => Rest().Any(p => p != ClosingPart.Disclaimer) || galleryPages == 0;
             int PhotoPages() => galleryPages + (Rest().Count > 0 && ClosingHeading() ? 1 : 0);
 
-            // Photos are a fixed 91 x 66mm — 4:3 near enough, the approved size. They used
-            // to grow to fill the page (to 74.5mm, 1.22:1), which trimmed the sides off
-            // every shot, and shrink to 56mm to make room for the disclaimer; a 16:9 GPS
-            // camera shot lost its watermark's edges both ways. A page that does not fill
-            // ends in white above the footer instead.
-            const double GalleryPanelMm = 66;
-
-            void GalleryPage(IContainer container, List<(string Label, byte[]? Image)> slice,
+            void GalleryPage(IContainer container, List<GalleryPhoto> slice,
                              int lift, bool measuring, string tag)
             {
                 container.Column(col =>
@@ -131,7 +132,7 @@ namespace Valuation.Api.Services
                     DrawSectionHeading(col.Item().PaddingBottom(Mm(3)), "camera", "Photographic Evidence", tag);
                     PhotoGrid(col, slice, GalleryPanelMm, measuring);
                     ClosingParts(col, closing.Take(lift).ToList(), afterPhotos: true,
-                                 tyres, tyreH, measuring);
+                                 tyreRow, tyreH, measuring);
                 });
             }
 
@@ -176,7 +177,7 @@ namespace Valuation.Api.Services
                     if (ClosingHeading())
                         DrawSectionHeading(col.Item().PaddingBottom(Mm(3)), "camera",
                                            "Photographic Evidence", $"{PhotoPages()} / {PhotoPages()}");
-                    ClosingParts(col, Rest(), afterPhotos: false, tyres, tyreH, measuring);
+                    ClosingParts(col, Rest(), afterPhotos: false, tyreRow, tyreH, measuring);
                 }), maxMm: 0)
             {
                 OwnPage = true,
@@ -184,8 +185,32 @@ namespace Valuation.Api.Services
             });
         }
 
+        /// <summary>A photograph for a panel: its caption, and how it fits the panel.</summary>
+        private sealed record GalleryPhoto(string Label, byte[] Image, PanelFit Fit);
+
+        /// <summary>
+        /// How a photo sits in a panel: filling it, when the two are the same shape to
+        /// within 1% (a stretch that small does not show, where the margin it would
+        /// otherwise leave does), or whole and centred over a blurred copy of itself.
+        /// </summary>
+        private sealed record PanelFit(bool Fills, byte[]? Backdrop)
+        {
+            public static PanelFit For(byte[] image, double photoAspect, double panelAspect) =>
+                Math.Abs(photoAspect / panelAspect - 1) <= 0.01
+                    ? new PanelFit(true, null)
+                    : new PanelFit(false, BlurredBackdrop(image, panelAspect));
+        }
+
+        /// <summary>
+        /// Gallery panels are 91mm wide and exactly 4:3, the shape of the 1600 x 1200 shots
+        /// most cases arrive with, so those fill their panel edge to edge. Six of them fill
+        /// a page: three rows end ~21mm above the footer.
+        /// </summary>
+        private const double GalleryPanelMm = HalfColumnMm * 3 / 4;
+        private const double GalleryAspect = HalfColumnMm / GalleryPanelMm;
+
         /// <summary>Photos two to a row, each over its caption.</summary>
-        private void PhotoGrid(ColumnDescriptor col, List<(string Label, byte[]? Image)> photos,
+        private void PhotoGrid(ColumnDescriptor col, List<GalleryPhoto> photos,
                                double panelMm, bool measuring)
         {
             for (int r = 0; r < photos.Count; r += 2)
@@ -200,13 +225,128 @@ namespace Valuation.Api.Services
                         if (idx < photos.Count)
                         {
                             var item = photos[idx];
-                            row.RelativeItem().Element(x =>
-                                LabelledPhoto(x, item.Image!, item.Label, HalfColumnMm, panelMm, measuring: measuring));
+                            row.RelativeItem().Element(x => LabelledPhoto(x, item, panelMm, measuring));
                         }
                         else row.RelativeItem();   // keep the surviving photo at half width
                     }
                 });
             }
+        }
+
+        /// <summary>
+        /// The shape a photo prints at, width over height. Read from the file's header, not
+        /// a full decode, and turned by its EXIF orientation as QuestPDF draws it, so a
+        /// phone shot stored on its side is measured upright.
+        /// </summary>
+        private static double PhotoAspect(byte[] image)
+        {
+            const double Fallback = 4.0 / 3;
+            try
+            {
+                using var data = SKData.CreateCopy(image);
+                using var codec = SKCodec.Create(data);
+                if (codec == null || codec.Info.Width <= 0 || codec.Info.Height <= 0) return Fallback;
+
+                double aspect = (double)codec.Info.Width / codec.Info.Height;
+                if (codec.EncodedOrigin is SKEncodedOrigin.LeftTop or SKEncodedOrigin.RightTop
+                                        or SKEncodedOrigin.RightBottom or SKEncodedOrigin.LeftBottom)
+                    aspect = 1 / aspect;
+                return aspect;
+            }
+            catch { return Fallback; }
+        }
+
+        /// <summary>
+        /// A photo shown whole, never cropped: filling its box when the shapes match,
+        /// otherwise centred over its backdrop.
+        ///
+        /// Panels used to be filled by cropping the photo to their shape, which suited only
+        /// a 4:3 shot. Cases arrive in 4:3, 16:9, 2:1 and portrait, and every other shape
+        /// lost its edges: on TG07V8118's 2:1 shots a sixth off each side, and with it the
+        /// GPS stamp at the bottom right; portrait shots lost almost half their height. The
+        /// cover's photo was stretched instead, and printed that truck a third too narrow.
+        /// </summary>
+        private static void WholePhoto(IContainer container, byte[] image, PanelFit fit)
+        {
+            if (fit.Fills)
+            {
+                container.Image(image).FitUnproportionally();
+                return;
+            }
+            container.Layers(l =>
+            {
+                l.Layer().Element(b => { if (fit.Backdrop != null) b.Image(fit.Backdrop).FitUnproportionally(); });
+                l.PrimaryLayer().AlignCenter().AlignMiddle().Image(image).FitArea();
+            });
+        }
+
+        /// <summary>
+        /// A soft, blurred copy of a photo that fills a box of the given shape: what a whole
+        /// photo is laid over in a box it does not match, in place of bands of grey. Null if
+        /// the photo cannot be read; the box then shows its own background.
+        /// </summary>
+        private static byte[]? BlurredBackdrop(byte[] image, double boxAspect)
+        {
+            try
+            {
+                using var data = SKData.CreateCopy(image);
+                using var codec = SKCodec.Create(data);
+                if (codec == null) return null;
+                using var raw = SKBitmap.Decode(codec);
+                if (raw == null) return null;
+                using var photo = Upright(raw, codec.EncodedOrigin);
+
+                // Small is enough for something this blurred, and cheap to encode.
+                const int W = 480;
+                int h = Math.Max(1, (int)Math.Round(W / boxAspect));
+                using var surface = SKSurface.Create(new SKImageInfo(W, h));
+                var canvas = surface.Canvas;
+
+                float scale = Math.Max((float)W / photo.Width, (float)h / photo.Height);
+                float dw = photo.Width * scale, dh = photo.Height * scale;
+                using var src = SKImage.FromBitmap(photo);
+                using var blur = new SKPaint
+                {
+                    ImageFilter = SKImageFilter.CreateBlur(18, 18, SKShaderTileMode.Clamp),
+                };
+                canvas.DrawImage(src, SKRect.Create((W - dw) / 2, (h - dh) / 2, dw, dh),
+                                 new SKSamplingOptions(SKFilterMode.Linear), blur);
+                // A white wash, so the sharp photo on top reads as the subject.
+                canvas.DrawColor(new SKColor(255, 255, 255, 90), SKBlendMode.SrcOver);
+
+                using var shot = surface.Snapshot();
+                using var jpeg = shot.Encode(SKEncodedImageFormat.Jpeg, 80);
+                return jpeg.ToArray();
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// A decoded photo turned the way its EXIF orientation says, as QuestPDF draws the
+        /// file itself. SkiaSharp decodes the pixels as stored, which for many phone shots
+        /// is on their side.
+        /// </summary>
+        private static SKBitmap Upright(SKBitmap bmp, SKEncodedOrigin origin)
+        {
+            float w = bmp.Width, h = bmp.Height;
+            // Maps each stored pixel to where it is seen: x' = a·x + b·y + c, y' = d·x + e·y + f.
+            (float a, float b, float c, float d, float e, float f) = origin switch
+            {
+                SKEncodedOrigin.TopRight    => (-1, 0, w,  0, 1, 0),   // mirrored
+                SKEncodedOrigin.BottomRight => (-1, 0, w,  0, -1, h),  // upside down
+                SKEncodedOrigin.BottomLeft  => (1, 0, 0,   0, -1, h),  // flipped
+                SKEncodedOrigin.LeftTop     => (0, 1, 0,   1, 0, 0),   // transposed
+                SKEncodedOrigin.RightTop    => (0, -1, h,  1, 0, 0),   // turned a quarter clockwise
+                SKEncodedOrigin.RightBottom => (0, -1, h, -1, 0, w),   // transversed
+                SKEncodedOrigin.LeftBottom  => (0, 1, 0,  -1, 0, w),   // turned a quarter anticlockwise
+                _                           => (1, 0, 0,   0, 1, 0),
+            };
+            bool sideways = a == 0;
+            var upright = new SKBitmap(sideways ? bmp.Height : bmp.Width, sideways ? bmp.Width : bmp.Height);
+            using var canvas = new SKCanvas(upright);
+            canvas.SetMatrix(new SKMatrix(a, b, c, d, e, f, 0, 0, 1));
+            canvas.DrawBitmap(bmp, 0, 0);
+            return upright;
         }
 
         private enum ClosingPart { Tyres, Disclaimer }
@@ -217,7 +357,7 @@ namespace Valuation.Api.Services
         /// first part is spaced off the grid above.
         /// </summary>
         private void ClosingParts(ColumnDescriptor col, List<ClosingPart> parts, bool afterPhotos,
-                                  List<byte[]> tyres, double tyreH, bool measuring)
+                                  List<GalleryPhoto> tyres, double tyreH, bool measuring)
         {
             bool first = !afterPhotos;
             foreach (var part in parts)
@@ -237,12 +377,10 @@ namespace Valuation.Api.Services
                                 if (i > 0) row.ConstantItem(Mm(3));
                                 if (i < tyres.Count)
                                 {
-                                    var img = tyres[i];
-                                    int n = i + 1;
-                                    // Contained, not cropped: cropping a tyre to its panel would
-                                    // cut off the tread, which is what the photograph evidences.
-                                    row.RelativeItem().Element(x =>
-                                        LabelledPhoto(x, img, $"TYRE {n}", 43.5, tyreH, contain: true, measuring: measuring));
+                                    var tyre = tyres[i];
+                                    // Shown whole: cropping a tyre to its panel would cut off
+                                    // the tread, which is what the photograph evidences.
+                                    row.RelativeItem().Element(x => LabelledPhoto(x, tyre, tyreH, measuring));
                                 }
                                 else row.RelativeItem();
                             }
@@ -282,37 +420,25 @@ namespace Valuation.Api.Services
             // Closed with the issuing company's name, which depends on the brand.
             "report is issued without prejudice by ";
 
+        /// <summary>The width of a tyre panel: four panels and three 3mm gaps span the page.</summary>
+        private const double TyreSlotMm = (2 * HalfColumnMm + 4 - 3 * 3) / 4;
+
         /// <summary>
         /// One panel height for the whole tyre row, from the shape of the photos in it.
         ///
-        /// Uses the tallest of the four relative to its width, so no photo is letterboxed
-        /// more than it has to be, and all four share a height so the row stays even.
-        /// Clamped: below 28mm a tyre is too small to judge tread, and above 74mm the row
-        /// crowds the disclaimer off the page.
+        /// The tallest of the four relative to its width sets it, so that one fills its
+        /// panel exactly and the rest sit on their backdrops no more than they have to; all
+        /// four share it so the row stays even. A set from one camera fills every panel.
+        /// Capped at 74mm, where the row would crowd the disclaimer off the page. There is
+        /// no floor: the 28mm one there was left 2:1 shots in a band of grey without making
+        /// the tyre itself any bigger.
         /// </summary>
-        private static double TyrePanelHeightMm(List<byte[]> images, double widthMm)
-        {
-            double tallest = 0;
-            foreach (var bytes in images)
-            {
-                try
-                {
-                    using var bmp = SKBitmap.Decode(bytes);
-                    if (bmp == null || bmp.Width <= 0) continue;
-                    tallest = Math.Max(tallest, widthMm * bmp.Height / bmp.Width);
-                }
-                catch { /* unreadable frame: it just does not vote on the height */ }
-            }
-            return tallest <= 0 ? 74 : Math.Clamp(tallest, 28, 74);
-        }
+        private static double TyreRowHeightMm(List<double> aspects) =>
+            aspects.Count == 0 ? 0 : Math.Min(TyreSlotMm / aspects.Min(), 74);
 
-        /// <summary>
-        /// A photo panel with its caption pill beneath. <paramref name="contain"/> fits
-        /// the whole frame inside the panel instead of filling it.
-        /// </summary>
-        private void LabelledPhoto(IContainer container, byte[] image, string label,
-                                   double widthMm, double heightMm, bool contain = false,
-                                   bool measuring = false)
+        /// <summary>A photo panel with its caption pill beneath, the photo shown whole.</summary>
+        private void LabelledPhoto(IContainer container, GalleryPhoto photo,
+                                   double heightMm, bool measuring)
         {
             container.Column(c =>
             {
@@ -322,25 +448,25 @@ namespace Valuation.Api.Services
                     l.PrimaryLayer().Element(x =>
                     {
                         // While FillPage measures, the photo is only a height — the panel's
-                        // is fixed above — so the decode and crop are skipped rather than
-                        // repeated at every step of the search.
+                        // is fixed above — so the decode is skipped rather than repeated at
+                        // every step of the search.
                         if (measuring) return;
-                        if (contain) x.AlignCenter().AlignMiddle().Image(image).FitArea();
-                        // Cropping to the panel's own aspect first means the fill does not
-                        // stretch the vehicle — QuestPDF has no object-fit: cover.
-                        else x.Image(CropToAspect(image, (float)(widthMm / heightMm))).FitUnproportionally();
+                        WholePhoto(x, photo.Image, photo.Fit);
                     });
                     l.Layer().Svg(s => RoundedPhotoMask(s.Width, s.Height, Mm(2.8), BorderImg));
                 });
 
-                c.Item().PaddingTop(Mm(1.8)).AlignLeft().Layers(l =>
+                // Scaled down rather than overflowing when a caption is wider than its
+                // photo: a custom photo's name can be any length, and a caption that
+                // overflows inside a page's fill throws the whole report.
+                c.Item().PaddingTop(Mm(1.8)).AlignLeft().ScaleToFit().Layers(l =>
                 {
                     l.Layer().Svg(s => RoundRect(s.Width, s.Height, Mm(10), Navy));
                     l.PrimaryLayer().PaddingVertical(Mm(0.9)).PaddingHorizontal(Mm(3.2)).Row(r =>
                     {
                         r.AutoItem().AlignMiddle().Element(x => DrawIcon(x, "camera", "#FFFFFF", 3.2));
                         r.ConstantItem(Mm(1.8));
-                        r.AutoItem().AlignMiddle().Text(label)
+                        r.AutoItem().AlignMiddle().Text(photo.Label)
                             .FontFamily(ReportFont).FontSize(7.4f).Bold().FontColor("#FFFFFF")
                             .LetterSpacing(Ls(0.3, 7.4));
                     });
