@@ -297,11 +297,11 @@ namespace Valuation.Api.Services
                     // INSPECTION is where the AVO inspected it, from the AVO page. BRANCH
                     // used to print the inspection location as well, so both boxes always
                     // read the same.
-                    var place = ins?.InspectionLocation?.ToUpperInvariant();
+                    var place = SpaceAfterCommas(ins?.InspectionLocation?.ToUpperInvariant());
                     var cells = new (string Icon, string Label, string? Value)[]
                     {
                         ("building-2", "CLIENT",              doc.Stakeholder?.Name?.ToUpperInvariant()),
-                        ("map-pin",    "BRANCH",              doc.Stakeholder?.Branch?.Trim().ToUpperInvariant()),
+                        ("map-pin",    "BRANCH",              SpaceAfterCommas(doc.Stakeholder?.Branch?.Trim().ToUpperInvariant())),
                         ("calendar",   "DATE OF INSPECTION",  ins?.DateOfInspection?.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture)),
                         ("map-pin",    "PLACE OF INSPECTION", place),
                     };
@@ -315,7 +315,7 @@ namespace Valuation.Api.Services
                          {
                              cell.AutoItem().AlignMiddle().Element(c => DrawChip(c, icon, 6.6, 3.6));
                              cell.ConstantItem(Mm(2.4));
-                             cell.RelativeItem().AlignMiddle().Element(c => DrawField(c, label, value));
+                             cell.RelativeItem().AlignMiddle().Element(c => DrawField(c, label, value, maxLines: 2));
                          });
                     }
                 });
@@ -405,12 +405,16 @@ namespace Valuation.Api.Services
                     {
                         if (col > 0) r.ConstantItem(Mm(5));
                         var f = ident[rowIdx * 3 + col];
+                        // Only the two names may run to a second line; everything else in
+                        // the grid is short, and held to one line so that, whatever the
+                        // data, the grid grows by one line at most.
+                        int lines = f.Label is "OWNER" or "APPLICANT" ? 2 : 1;
                         r.RelativeItem().BorderBottom(1).BorderColor(BorderIn)
                          .PaddingVertical(Mm(0.8)).Row(cell =>
                          {
                              cell.AutoItem().AlignMiddle().Element(c => DrawChip(c, f.Icon, 6.6, 3.6));
                              cell.ConstantItem(Mm(2.4));
-                             cell.RelativeItem().AlignMiddle().Element(c => DrawField(c, f.Label, f.Value));
+                             cell.RelativeItem().AlignMiddle().Element(c => DrawField(c, f.Label, f.Value, maxLines: lines));
                          });
                     }
                 });
@@ -518,9 +522,23 @@ namespace Valuation.Api.Services
             // wrap. The QR and the signature settle to the foot of the row. Capped at
             // 40mm: if long data pushes this row onto a page of its own, it should not
             // swell to fill that one.
-            main.Item().Dynamic(new FillPage((block, extra, _) => block.PaddingTop(Mm(3.4)).Row(r =>
+            //
+            // A page with too little left gets up to 4mm back rather than losing the row
+            // to page two, where it sat alone on AP39UM0018: first the gap above it, then
+            // the remarks box and QR code a little smaller, down to the signature block's
+            // own height. A QR code of 18mm still scans.
+            static (double GapMm, double BoxMm, double QrMm) SignOff(double extra)
             {
-                r.RelativeItem().Height(Mm(25 + extra)).Layers(l =>
+                double squeeze = Math.Min(0, extra + 2);             // 0 .. -2
+                return (3.4 + Math.Clamp(extra, -2, 0),             // 1.4 .. 3.4
+                        25 + Math.Max(extra, 0) + squeeze,          // 23 .. 65
+                        20.5 + squeeze * 1.25);                     // 18 .. 20.5
+            }
+
+            main.Item().Dynamic(new FillPage((block, extra, _) => block.PaddingTop(Mm(SignOff(extra).GapMm)).Row(r =>
+            {
+                var (_, boxMm, qrMm) = SignOff(extra);
+                r.RelativeItem().Height(Mm(boxMm)).Layers(l =>
                 {
                     l.Layer().Svg(s => LeftBarCard(s.Width, s.Height, Mm(2.6), Mm(1.2), Orange, "#F6F8FB", Border));
                     l.PrimaryLayer().PaddingVertical(Mm(3.2)).PaddingHorizontal(Mm(4)).Column(c =>
@@ -538,7 +556,7 @@ namespace Valuation.Api.Services
                 r.ConstantItem(Mm(30)).AlignBottom().Column(c =>
                 {
                     if (qrCode.Length > 0)
-                        c.Item().AlignCenter().Width(Mm(20.5)).Height(Mm(20.5))
+                        c.Item().AlignCenter().Width(Mm(qrMm)).Height(Mm(qrMm))
                             .Hyperlink($"https://prontofirebase.web.app/verify/{referenceNumber}")
                             .Image(qrCode).FitArea();
                     c.Item().PaddingTop(Mm(1)).AlignCenter().Text("VERIFY ONLINE")
@@ -563,7 +581,7 @@ namespace Valuation.Api.Services
                     c.Item().PaddingTop(Mm(0.8)).AlignRight().Text($"License No: {ApproverLicenseNo}")
                         .FontFamily(ReportFont).FontSize(7.6f).FontColor(Label);
                 });
-            }), maxMm: 40));
+            }), maxMm: 40, minMm: -4));
         }
 
         // ──────────────────────────────────────────────
@@ -738,6 +756,14 @@ namespace Valuation.Api.Services
         /// — a wrap pushes the card past its fixed height and the sign-off block onto
         /// a second page. Measured, not estimated: see the probe's --amount flag.
         /// </summary>
+        /// <summary>
+        /// A place typed without a space after its commas, given one, so it wraps between
+        /// its parts. "AUTONAGAR,TAKKELLAPADU, GUNTUR" is one long word to the line breaker
+        /// up to its second comma: the cover split it mid-word, over three lines.
+        /// </summary>
+        private static string? SpaceAfterCommas(string? text) =>
+            text == null ? null : Regex.Replace(text, @",(?=\S)", ", ");
+
         private static float AmountFontSize(string amount) =>
             amount.Length <= 10 ? 24f
           : amount.Length <= 11 ? 21f
