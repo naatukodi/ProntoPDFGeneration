@@ -220,7 +220,13 @@ namespace Valuation.Api.Services
                                    ?? photos.GetValueOrDefault("FrontView")
                                    ?? photos.GetValueOrDefault("FrontLeftSide")
                                    ?? photos.Values.FirstOrDefault();
-                        if (img != null) c.Image(img).FitUnproportionally();
+                        if (img != null)
+                        {
+                            // Whole, as on the photo pages: stretched into this 4:3 box, the
+                            // 2:1 shots on TG07V8118 printed the truck a third too narrow.
+                            const double box = 100.0 / 75;
+                            WholePhoto(c, img, PanelFit.For(img, PhotoAspect(img), box));
+                        }
                         else c.Background("#F8FAFC").AlignCenter().AlignMiddle()
                               .Text("NO IMAGE AVAILABLE").FontFamily(ReportFont).FontSize(10).FontColor(Label);
                     });
