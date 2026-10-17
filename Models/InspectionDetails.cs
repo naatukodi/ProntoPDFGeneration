@@ -12,6 +12,9 @@ namespace Valuation.Api.Models
         public string? VehicleMoved { get; set; }
         public string? EngineStarted { get; set; }
         public long? Odometer { get; set; }
+        /// <summary>Words the AVO typed when the odometer cannot be read ("NOT WORKING").
+        /// The API keeps it only while <see cref="Odometer"/> is empty.</summary>
+        public string? OdometerRemark { get; set; }
         public bool? VinPlate { get; set; }
         /// <summary>Accident status from the AVO page, printed on the cover beside DEDUPE.</summary>
         public bool? Accidental { get; set; }

@@ -126,6 +126,14 @@ namespace Valuation.Api.Services
             return (months / 12, months % 12, perYear);
         }
 
+        /// <summary>The reading in km, or what the AVO typed when the odometer could not be
+        /// read ("NOT WORKING"); null when neither was recorded.</summary>
+        private static string? OdometerText(VehicleDetailsDto? vd, InspectionDetails? ins)
+        {
+            if ((vd?.Odometer ?? ins?.Odometer) is long o && o > 0) return $"{Indian(o)} km";
+            return string.IsNullOrWhiteSpace(ins?.OdometerRemark) ? null : ins.OdometerRemark.Trim().ToUpperInvariant();
+        }
+
         /// <summary>1st / 2nd / 3rd / 4th owner, from the RC's owner serial.</summary>
         private static string OwnerOrdinal(string? serial)
         {
@@ -344,7 +352,10 @@ namespace Valuation.Api.Services
                             c.Item().Text(label.ToUpperInvariant())
                                 .FontFamily(ReportFont).FontSize(6.6f).Bold().FontColor(Label)
                                 .LetterSpacing(Ls(0.25, 6.6));
-                            c.Item().PaddingTop(Mm(0.5)).Text(value)
+                            // Held to one line, drawn smaller when longer: words typed in
+                            // place of an odometer reading ("METER DISPLAY DAMAGED") wrapped
+                            // here and pushed the cover's sign-off onto page two.
+                            c.Item().PaddingTop(Mm(0.5)).MaxHeight(10.4f * 1.4f).ScaleToFit().Text(value)
                                 .FontFamily(ReportFont).FontSize(10.4f).Bold().FontColor(Navy);
                             c.Item().Text(sub ?? "").FontFamily(ReportFont).FontSize(7).FontColor(Label);
                         });
@@ -356,9 +367,7 @@ namespace Valuation.Api.Services
                      $"Mfg {ResolveMfgYear(vd)}", Teal, "#FFFFFF");
                 r.ConstantItem(Mm(2.4));
 
-                long? odo = vd?.Odometer ?? ins?.Odometer;
-                Fact("Odometer",
-                     odo.HasValue ? $"{Indian(odo.Value)} km" : "-",
+                Fact("Odometer", OdometerText(vd, ins) ?? "-",
                      kmYear.HasValue ? $"≈ {Indian(kmYear.Value)} km / year" : null, Teal, "#FFFFFF");
                 r.ConstantItem(Mm(2.4));
 
@@ -392,7 +401,7 @@ namespace Valuation.Api.Services
                 ("fuel",         "FUEL TYPE",        vd?.Fuel),
                 ("settings-2",   "TRANSMISSION",     ins?.TransmissionType),
                 ("palette",      "COLOUR",           vd?.Colour),
-                ("gauge",        "ODO METER",        (vd?.Odometer ?? ins?.Odometer) is long o && o > 0 ? $"{Indian(o)} km" : null),
+                ("gauge",        "ODO METER",        OdometerText(vd, ins)),
                 // Upper-cased to match the VAHAN page, which already does. VAHAN returns
                 // this field in mixed case, so the same vehicle read "Goods Carrier(LGV)"
                 // on the cover and "GOODS CARRIER(LGV)" two pages later.
