@@ -15,6 +15,14 @@ namespace Valuation.Api.Models
         /// <summary>Words the AVO typed when the odometer cannot be read ("NOT WORKING").
         /// The API keeps it only while <see cref="Odometer"/> is empty.</summary>
         public string? OdometerRemark { get; set; }
+        /// <summary>"KM", or "HOURS" when the AVO recorded engine hours off an hour meter
+        /// (tractors, cranes). Empty means KM — every case before 2026-11-19. Must exist in
+        /// BOTH copies of this model (Valuation.Api and ProntoPDFGeneration).</summary>
+        public string? OdometerUnit { get; set; }
+
+        /// <summary>True when <see cref="Odometer"/> is engine hours rather than kilometres.</summary>
+        public bool OdometerInHours() =>
+            OdometerUnit?.Trim().ToUpperInvariant() is "HOURS" or "HOUR" or "HRS" or "HR" or "H";
         public bool? VinPlate { get; set; }
         /// <summary>Accident status from the AVO page, printed on the cover beside DEDUPE.</summary>
         public bool? Accidental { get; set; }

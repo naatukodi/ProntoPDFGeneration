@@ -97,9 +97,14 @@ namespace Valuation.Api.Services
         }
 
         /// <summary>
-        /// Age, and distance per year. Both are stated on the cover's fact strip and
-        /// neither is stored, so they are derived the way the template derives them:
-        /// whole months between manufacture and inspection.
+        /// Age, and distance (or engine hours) per year. Both are stated on the cover's
+        /// fact strip and neither is stored, so they are derived the way the template
+        /// derives them: whole months between manufacture and inspection.
+        ///
+        /// ManufacturedDate comes first, as it does for the "Mfg" label under the age.
+        /// Until 2026-11-19 the API copied the REGISTRATION date into Year/MonthOfMfg, so
+        /// reading those first aged JH13N8259 — made MAR-2025, registered NOV-2026 — as
+        /// "0 yrs 0 mo" with "Mfg MAR-2025" printed right beneath it.
         ///
         /// Returns nulls rather than zeros when the dates are missing — "0 yrs 0 mo"
         /// on a report reads as a fact, where a dash reads as the absence of one.
@@ -107,8 +112,9 @@ namespace Valuation.Api.Services
         private static (int? Years, int? Months, long? KmPerYear) DeriveAge(ValuationDocument doc)
         {
             var vd = doc.VehicleDetails;
-            int? mfgYear = vd?.YearOfMfg ?? vd?.ManufacturedDate?.Year;
-            int? mfgMonth = vd?.MonthOfMfg ?? vd?.ManufacturedDate?.Month;
+            int? mfgYear = vd?.ManufacturedDate?.Year ?? vd?.YearOfMfg;
+            int? mfgMonth = vd?.ManufacturedDate?.Month ?? vd?.MonthOfMfg;
+            if (mfgMonth is < 1 or > 12) mfgMonth = null;
             if (mfgYear is null or <= 0) return (null, null, null);
             mfgMonth ??= 1;
 
@@ -121,16 +127,25 @@ namespace Valuation.Api.Services
             long? odo = doc.VehicleDetails?.Odometer ?? doc.InspectionDetails?.Odometer;
             long? perYear = null;
             if (odo is > 0 && months > 0)
-                perYear = (long)(Math.Round(odo.Value / (months / 12.0) / 100.0) * 100);
+            {
+                // Km round to the nearest 100. Engine hours run in the hundreds a
+                // year, where rounding to 100 would wipe out most of the figure.
+                double step = doc.InspectionDetails?.OdometerInHours() == true ? 10.0 : 100.0;
+                perYear = (long)(Math.Round(odo.Value / (months / 12.0) / step) * step);
+            }
 
             return (months / 12, months % 12, perYear);
         }
 
-        /// <summary>The reading in km, or what the AVO typed when the odometer could not be
-        /// read ("NOT WORKING"); null when neither was recorded.</summary>
+        /// <summary>"hrs" for an hour meter (tractors, cranes), else "km".</summary>
+        private static string OdometerUnit(InspectionDetails? ins) =>
+            ins?.OdometerInHours() == true ? "hrs" : "km";
+
+        /// <summary>The reading with its unit ("386 hrs", "45,000 km"), or what the AVO typed
+        /// when the meter could not be read ("NOT WORKING"); null when neither was recorded.</summary>
         private static string? OdometerText(VehicleDetailsDto? vd, InspectionDetails? ins)
         {
-            if ((vd?.Odometer ?? ins?.Odometer) is long o && o > 0) return $"{Indian(o)} km";
+            if ((vd?.Odometer ?? ins?.Odometer) is long o && o > 0) return $"{Indian(o)} {OdometerUnit(ins)}";
             return string.IsNullOrWhiteSpace(ins?.OdometerRemark) ? null : ins.OdometerRemark.Trim().ToUpperInvariant();
         }
 
@@ -367,8 +382,9 @@ namespace Valuation.Api.Services
                      $"Mfg {ResolveMfgYear(vd)}", Teal, "#FFFFFF");
                 r.ConstantItem(Mm(2.4));
 
-                Fact("Odometer", OdometerText(vd, ins) ?? "-",
-                     kmYear.HasValue ? $"≈ {Indian(kmYear.Value)} km / year" : null, Teal, "#FFFFFF");
+                bool hourMeter = ins?.OdometerInHours() == true;
+                Fact(hourMeter ? "Hour meter" : "Odometer", OdometerText(vd, ins) ?? "-",
+                     kmYear.HasValue ? $"≈ {Indian(kmYear.Value)} {OdometerUnit(ins)} / year" : null, Teal, "#FFFFFF");
                 r.ConstantItem(Mm(2.4));
 
                 Fact("Ownership", OwnerOrdinal(vd?.OwnerSerialNo),
@@ -401,7 +417,7 @@ namespace Valuation.Api.Services
                 ("fuel",         "FUEL TYPE",        vd?.Fuel),
                 ("settings-2",   "TRANSMISSION",     ins?.TransmissionType),
                 ("palette",      "COLOUR",           vd?.Colour),
-                ("gauge",        "ODO METER",        OdometerText(vd, ins)),
+                ("gauge",        ins?.OdometerInHours() == true ? "HOUR METER" : "ODO METER", OdometerText(vd, ins)),
                 // Upper-cased to match the VAHAN page, which already does. VAHAN returns
                 // this field in mixed case, so the same vehicle read "Goods Carrier(LGV)"
                 // on the cover and "GOODS CARRIER(LGV)" two pages later.
